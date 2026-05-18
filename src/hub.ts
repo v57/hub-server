@@ -83,6 +83,10 @@ export class Hub {
           this.addServices(sender, state, Array.from(add), context)
           this.removeServices(sender, state, Array.from(remove), context)
           for (const service of s) {
+            const limit = service.limit ?? 0
+            if (Number.isFinite(limit) && limit >= 0) {
+              this.services.get(service.path)?.setLimit(sender, service.limit ?? 0)
+            }
             const p = service.permissions
             if (p) {
               const group = p.group ?? service.path.split('/')[0]
@@ -351,7 +355,7 @@ export class Hub {
         this.services.set(s, service)
       }
       const enabled = security.allowsHost(state.key, s)
-      service.add({ sender, state, enabled, sending: new Set(), streams: 0 }, context)
+      service.add({ sender, state, enabled, sending: new Set(), streams: 0, limit: 0 }, context)
     })
     console.log('+', services.length, 'api')
   }
@@ -391,22 +395,13 @@ export class Hub {
 
 const other = () => true
 
-function parseServiceProvidersKey(key: string): { stateKey?: string; path: string } {
-  const index = key.indexOf('\u0000')
-  if (index === -1) return { path: key }
-  const stateKey = key.slice(0, index)
-  return {
-    stateKey: stateKey.length ? stateKey : undefined,
-    path: key.slice(index + 1),
-  }
-}
-
 export interface Service {
   state: State
   sender: Sender
   sending: Set<Cancellable>
   streams: number
   enabled: boolean
+  limit: number
 }
 
 class Services {
@@ -417,6 +412,7 @@ class Services {
   pending: ((service: Service | undefined) => void)[] = []
   loadBalancer: LoadBalancer.Type
   isEnabled = false
+  limited = false
   constructor(name: string) {
     this.name = name
     this.loadBalancer = new LoadBalancer.Counter()
@@ -435,6 +431,24 @@ class Services {
       if (this.disabled.findIndex(a => a.sender === service.sender) === -1) {
         this.disabled.push(service)
       }
+    }
+  }
+  setLimit(sender: Sender, limit: number) {
+    if (limit > 0 && !this.limited) {
+      this.limited = true
+      if (!this.loadBalancer.allowsLimit) {
+        this.loadBalancer = new LoadBalancer.Counter()
+      }
+    }
+    let index = this.services.findIndex(a => a.sender === sender)
+    if (index >= 0) {
+      this.services[index].limit = limit
+      return
+    }
+    index = this.disabled.findIndex(a => a.sender === sender)
+    if (index >= 0) {
+      this.disabled[index].limit = limit
+      return
     }
   }
   select(id: string): Service | undefined {
@@ -533,19 +547,23 @@ class Services {
   }
   setBalancer(name: LoadBalancer.Name) {
     if (this.loadBalancer.name === name) return
+    let loadBalancer: LoadBalancer.Type
     switch (name) {
       case 'random':
-        this.loadBalancer = new LoadBalancer.Random()
+        loadBalancer = new LoadBalancer.Random()
         break
       case 'counter':
-        this.loadBalancer = new LoadBalancer.Counter()
+        loadBalancer = new LoadBalancer.Counter()
         break
       case 'first':
-        this.loadBalancer = new LoadBalancer.FirstAvailable()
+        loadBalancer = new LoadBalancer.FirstAvailable()
         break
       case 'available':
-        this.loadBalancer = new LoadBalancer.CounterAvailable()
+        loadBalancer = new LoadBalancer.CounterAvailable()
         break
+    }
+    if (!this.limited || loadBalancer.allowsLimit) {
+      this.loadBalancer = loadBalancer
     }
   }
   completed(service: Service) {
@@ -613,6 +631,7 @@ interface AppHeader {
 interface ServiceHeader {
   path: string
   permissions?: ServicePermissions
+  limit?: number
 }
 interface ServicePermissions {
   group?: string
