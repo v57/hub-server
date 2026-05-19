@@ -265,16 +265,26 @@ export class Hub {
         if (!service) throw 'api not found'
         if (!security.allowsCall(key, path)) throw 'permissions required'
         const selected = typeof context?.service === 'string' ? service.select(context.service) : undefined
-        const s = selected ?? (await service.next())
+        let s = selected ?? service.next()
+        if (!s) s = await service.addPending()
         if (!s) throw 'api not found'
-        if (task?.isCancelled) throw 'cancelled'
+        if (task?.isCancelled) {
+          service.completed(s)
+          throw 'cancelled'
+        }
         service.requests += 1
         requests += 1
         statusState.setNeedsUpdate()
         const request = s.sender.request(path, body)
         try {
-          if (task) s.sending.add(task)
-          task?.onCancel(request.cancel)
+          if (task) {
+            s.sending.add(task)
+            task.onCancel(() => {
+              request.cancel()
+              s.sending.delete(task)
+              service.completed(s)
+            })
+          }
           return await request.response
         } finally {
           if (task) s.sending.delete(task)
@@ -507,13 +517,11 @@ class Services {
   private _next(): Service | undefined {
     return this.loadBalancer.next(this.services)
   }
-  async next(): Promise<Service | undefined> {
-    if (this.pending.length > 0) return this.addPending()
-    const service = this._next()
-    if (service) return service
-    return this.addPending()
+  next(): Service | undefined {
+    if (this.pending.length > 0) return
+    return this._next()
   }
-  private addPending(): Promise<Service | undefined> {
+  addPending(): Promise<Service | undefined> {
     if (settings.data.pendingLimit > 0) {
       const deleteCount = this.pending.length + 1 - settings.data.pendingLimit
       if (deleteCount > 0) this.pending.splice(0, deleteCount)
