@@ -289,6 +289,7 @@ export class Hub {
         } finally {
           if (task) s.sending.delete(task)
           service.completed(s)
+          statusState.setNeedsUpdate()
         }
       })
       .streamOther(other, async function* ({ body, path, context, state: { key } }) {
@@ -296,7 +297,8 @@ export class Hub {
         if (!service) throw 'api not found'
         if (!security.allowsCall(key, path)) throw 'permissions required'
         const selected = typeof context?.service === 'string' ? service.select(context.service) : undefined
-        const s = selected ?? (await service.next())
+        let s = selected ?? service.next()
+        if (!s) s = await service.addPending()
         if (!s) throw 'api not found'
         service.requests += 1
         requests += 1
@@ -575,7 +577,7 @@ class Services {
     }
   }
   completed(service: Service) {
-    if (service.sending.size > 0 || this.pending.length === 0) return
+    if (this.pending.length === 0) return
     this.pending.shift()?.(service)
   }
 }
