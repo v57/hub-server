@@ -23,12 +23,17 @@ while (true) {
       const id = argv.shift()
       if (id) security.addOwner(id)
       break
+    case '--launcher':
+      security.launcher = argv.shift()
+      break
     default:
       break
   }
 }
 const owner = Bun.env['HUBOWNER']
+const launcher = Bun.env['HUBLAUNCHER']
 if (owner?.length) security.addOwner(owner)
+if (launcher?.length) security.launcher = launcher
 
 const hub = new Hub(port)
 merges.forEach(address => {
