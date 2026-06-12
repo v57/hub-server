@@ -154,7 +154,7 @@ class Keys {
       else return
     }
     const parts = signedKey.split('.')
-    if (parts.length !== 4 && parts[0] !== 'key' && parts.length === 4) throw 'invalid key'
+    if (parts.length !== 4 || parts[0] !== 'key') throw 'invalid key'
     const [_, key, hash, time] = parts
     if (whitelist.enabled && !whitelist.allows(key)) throw 'hub is not available'
     if (!this.verifyPub(key, hash, time)) throw 'invalid signature'
@@ -436,7 +436,7 @@ class GroupNames {
     this.storage.save()
   }
   contains(path: string): boolean {
-    return this.paths.get(path).size ? true : false
+    return this.restricted.has(path)
   }
   list(): { path: string; name: string }[] {
     return Object.entries(this.names.storage).map(([path, name]) => ({ path, name: name as string }))
