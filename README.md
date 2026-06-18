@@ -1,5 +1,7 @@
-# hub-pro
-
+<h1>
+  <img alt="Containerization logo" src="./icon.png" width="70" valign="middle">
+  &nbsp;hub-pro
+</h1>
 To install dependencies:
 
 ```bash
