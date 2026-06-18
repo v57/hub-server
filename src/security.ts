@@ -103,6 +103,7 @@ export class Security implements SecurityInterface {
   call = new Call()
   group = new Group()
   owners = new Set<string>()
+  launcher?: string
   whitelist = new Whitelist()
 
   async load() {
@@ -132,6 +133,7 @@ export class Security implements SecurityInterface {
   allowsHost(user: string | undefined, path: string): boolean {
     if (!user) return false
     if (path.startsWith('hub/')) return false
+    if (this.launcher && path.startsWith('launcher/') && user === this.launcher) return true
     if (this.owners.has(user)) return true
     if (this.host.allows(user, path)) return true
     this.host.ask(user, path)
