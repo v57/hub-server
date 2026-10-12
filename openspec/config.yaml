@@ -1,0 +1,28 @@
+schema: spec-driven
+
+context: |
+  Hub is a Bun/TypeScript RPC and service-discovery ecosystem with a Swift client library and Apple app.
+  This repository is hub-pro, the authoritative control plane for permissions and service registration.
+  Cross-project planning may affect hub-pro, hub-net, hub-net-node, channel-go, hub-service-go,
+  hub-service, HubService, Hub App, hub-launcher, hub-store, hub-s3, and hub-s3-local. Copies under
+  related/ are research references and must not be edited as implementation targets.
+  Hub Network uses WireGuard for encrypted peer-to-peer data transport. hub-net is the local agent.
+  hub-net and hub-net-node are implemented in Go. hub-service-go is implemented before either and
+  builds on a stabilized channel-go library. Apple packet-tunnel integration remains Swift/WireGuardKit.
+  hub-net-node initially provides rendezvous and NAT-traversal coordination only; it must not carry
+  application traffic in the initial release. A future, separately specified gateway role may route
+  full-tunnel VPN traffic.
+  Network permissions are separate from RPC API permissions but reuse Hub identities and groups.
+
+rules:
+  proposal:
+    - Clearly distinguish the initial rendezvous-only node from the future gateway role.
+  design:
+    - Include trust boundaries, failure behavior, and cross-project ownership.
+    - Do not design an application-traffic relay fallback.
+  specs:
+    - Use testable requirements and scenarios.
+    - Keep Go, Bun, and Swift service APIs behaviorally equivalent.
+  tasks:
+    - Prefix tasks with stable HN identifiers.
+    - State the target repository for every implementation task.
