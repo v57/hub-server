@@ -210,7 +210,6 @@ export class LocalAgentBindingStore {
   ) {}
 
   async load(): Promise<void> {
-    console.log('load')
     try {
       const value = await Bun.file(this.path).json() as StoredBinding
       if (value?.binding?.version === 1) {
@@ -228,10 +227,8 @@ export class LocalAgentBindingStore {
   }
 
   async register(key: string, connectionId: string): Promise<LocalAgentProof> {
-    console.log('register')
     let proof: LocalAgentProof
     try {
-      console.log('proving', key, connectionId)
       proof = await this.verifier.prove(key, connectionId)
     } catch (error) {
       this.lastError = error instanceof Error ? error.message : String(error)
@@ -263,7 +260,6 @@ export class LocalAgentBindingStore {
   }
 
   async authorizeRebind(key: string): Promise<void> {
-    console.log('authorizeRebind')
     if (!key) throw new Error('invalid_local_agent_rebind')
     this.data.pendingRebind = { key }
     await this.commit()
@@ -274,7 +270,6 @@ export class LocalAgentBindingStore {
     connectionId: string,
     key: string,
   ): AppleLocalAgentBinding {
-    console.log('bindApple')
     const current = this.binding('apple-app') as AppleLocalAgentBinding | undefined
     if (current) {
       const sameTunnel = current.connectionId === connectionId
@@ -315,7 +310,6 @@ export class LocalAgentBindingStore {
     connectionId: string,
     key: string,
   ): AppleLocalAgentBinding {
-    console.log('renewApple')
     const current = this.binding('apple-app') as AppleLocalAgentBinding | undefined
     if (
       !current
@@ -330,7 +324,6 @@ export class LocalAgentBindingStore {
   }
 
   unbindApple(request: AppleAppAgentUnbindRequest, connectionId: string): void {
-    console.log('unbindApple')
     const current = this.binding('apple-app') as AppleLocalAgentBinding | undefined
     if (!current) return
     if (
@@ -343,7 +336,6 @@ export class LocalAgentBindingStore {
   }
 
   disconnect(connectionId: string): void {
-    console.log('disconnect')
     this.connected.delete(connectionId)
     const apple = this.binding('apple-app') as AppleLocalAgentBinding | undefined
     if (apple?.connectionId === connectionId) {
@@ -352,12 +344,10 @@ export class LocalAgentBindingStore {
   }
 
   binding(kind: LocalAgentBinding['bindingKind']): LocalAgentBinding | undefined {
-    console.log('binding')
     return this.bindings.get(kind)
   }
 
   readyBinding(): LocalAgentBinding | undefined {
-    console.log('readyBinding')
     this.expireApple()
     const machine = this.binding('machine') as MachineLocalAgentBinding | undefined
     if (
@@ -377,7 +367,6 @@ export class LocalAgentBindingStore {
   }
 
   readyBindingPin(): LocalAgentBindingPin | undefined {
-    console.log('readyBindingPin')
     const binding = this.readyBinding()
     if (!binding) return
     return {
@@ -391,7 +380,6 @@ export class LocalAgentBindingStore {
   }
 
   status(): LocalAgentStatus {
-    console.log('status')
     this.expireApple()
     const machine = this.binding('machine') as MachineLocalAgentBinding | undefined
     const apple = this.binding('apple-app') as AppleLocalAgentBinding | undefined
@@ -438,7 +426,6 @@ export class LocalAgentBindingStore {
   }
 
   private async commit(): Promise<void> {
-    console.log('commit')
     const write = this.writeChain.then(async () => {
       await mkdir(dirname(this.path), { recursive: true })
       const temporaryPath = `${this.path}.${crypto.randomUUID()}.tmp`
@@ -450,10 +437,8 @@ export class LocalAgentBindingStore {
   }
 
   private scheduleAppleExpiry(binding: AppleLocalAgentBinding): void {
-    console.log('scheduleAppleExpiry')
     if (this.appleExpiryTimer) clearTimeout(this.appleExpiryTimer)
     const delay = Math.max(0, Date.parse(binding.expiresAt) - Date.now())
-    console.log('scheduleAppleExpiry', delay)
     this.appleExpiryTimer = setTimeout(() => {
       this.appleExpiryTimer = undefined
       this.expireApple()
@@ -472,10 +457,8 @@ export class LocalAgentBindingStore {
     binding: AppleLocalAgentBinding,
     reason: 'lease_expired' | 'connection_disconnected' | 'unbound',
   ): void {
-    console.log('invalidateApple')
     if (this.binding('apple-app') !== binding) return
     if (this.appleExpiryTimer) clearTimeout(this.appleExpiryTimer)
-    console.log('invalidating apple')
     this.appleExpiryTimer = undefined
     this.bindings.delete('apple-app')
     this.connected.delete(binding.connectionId)

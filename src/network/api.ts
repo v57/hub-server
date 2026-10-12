@@ -887,8 +887,11 @@ export class NetworkAPI {
    * List agents filtered by permissions.
    */
   listAgents(state: State): AgentProfile[] {
+    // The owner and the hub host's own agent see every member: the agent keeps
+    // a WireGuard peer per member and enforces their port grants.
     const isHubOwner = this.security.isOwner(state.key ?? '')
-    if (isHubOwner) {
+    const isLocalAgent = !!state.key && this.localAgent.binding('machine')?.key === state.key
+    if (isHubOwner || isLocalAgent) {
       return this.agents.listProfiles()
     }
 
