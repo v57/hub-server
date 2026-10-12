@@ -1,6 +1,6 @@
 import { sign, verify, type KeyLike } from 'node:crypto'
 import { createPublicKey } from 'node:crypto'
-import type { ConnectionGrant, GatewayGrant, RendezvousTicket } from './wire'
+import type { ConnectionGrant, DirectBootstrapResponse, GatewayGrant, RendezvousTicket } from './wire'
 import { HUB_NETWORK_WIRE_VERSION } from './wire'
 
 export type SignaturePurpose =
@@ -11,6 +11,7 @@ export type SignaturePurpose =
   | 'network-invitation'
   | 'gateway-grant'
   | 'apple-app-agent-readiness'
+  | 'direct-bootstrap-response'
 
 export const SIGNATURE_DOMAINS: Record<SignaturePurpose, string> = {
   'agent-attestation': 'hub-network/agent-attestation/v1',
@@ -20,6 +21,7 @@ export const SIGNATURE_DOMAINS: Record<SignaturePurpose, string> = {
   'network-invitation': 'hub-network/invitation/v1',
   'gateway-grant': 'hub-network/gateway-grant/v1',
   'apple-app-agent-readiness': 'hub-network/apple-app-agent-readiness/v1',
+  'direct-bootstrap-response': 'hub-network/direct-bootstrap-response/v1',
 }
 
 function canonicalJSON(value: unknown): string {
@@ -77,6 +79,7 @@ export const CONNECTION_GRANT_MAX_LIFETIME_MS = 5 * 60 * 1000
 export const RENDEZVOUS_TICKET_MAX_LIFETIME_MS = 10 * 60 * 1000
 export const GATEWAY_GRANT_MAX_LIFETIME_MS = 5 * 60 * 1000
 export const APPLE_APP_AGENT_READINESS_MAX_LIFETIME_MS = 30 * 1000
+export const DIRECT_BOOTSTRAP_MAX_LIFETIME_MS = 10 * 60 * 1000
 const MAX_CLOCK_SKEW_MS = 30 * 1000
 
 function publicKeyFromBase64(value: string): KeyLike {
@@ -209,5 +212,33 @@ export class SignedEnvelopeReplayGuard {
     if (this.consumed.has(id)) return false
     this.consumed.set(id, Date.parse(expiresAtValue))
     return true
+  }
+}
+
+/**
+ * Validates an invitation admission: the direct bootstrap response an inviter
+ * signed for this joiner. It must be signed by `inviterServiceKey`, bound to the
+ * joiner's service and WireGuard keys, and still valid. The caller checks that
+ * the inviter is a current agent of this network.
+ */
+export function validateJoinAdmission(
+  admission: DirectBootstrapResponse,
+  joinerKey: string,
+  joinerWireGuardKey: string,
+  now = Date.now(),
+): boolean {
+  try {
+    return admission.version === HUB_NETWORK_WIRE_VERSION
+      && admission.signatureDomain === SIGNATURE_DOMAINS['direct-bootstrap-response']
+      && admission.joinerServiceKey === joinerKey
+      && admission.joinerWireGuardKey === joinerWireGuardKey
+      && hasValidLifetime(admission.issuedAt, admission.expiresAt, DIRECT_BOOTSTRAP_MAX_LIFETIME_MS, now)
+      && verifyEnvelope(
+        'direct-bootstrap-response',
+        admission,
+        publicKeyFromBase64(admission.inviterServiceKey),
+      )
+  } catch {
+    return false
   }
 }

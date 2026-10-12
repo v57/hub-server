@@ -21,6 +21,7 @@ import type {
   AppleAppAgentBindRequest,
   AppleAppAgentRenewRequest,
   LocalAgentBindingStatus,
+  DirectBootstrapResponse,
 } from './wire'
 import { networkError, HUB_NETWORK_WIRE_VERSION } from './wire'
 import {
@@ -30,6 +31,7 @@ import {
   signatureInput,
   verifyEnvelope,
   validateAppleAppAgentReadiness,
+  validateJoinAdmission,
 } from './crypto'
 import { randomUUIDv7 } from 'bun'
 import { NetworkRegistry, AgentRegistry, NetworkPermissions } from './registry'
@@ -115,7 +117,6 @@ export class NetworkAPI {
     _sender: Sender,
     state: State,
   ): NetworkSharePublication[] {
-    console.log('handleSharesReplace')
     if (!state.key) {
       throw networkError('unauthorized', 'authentication required', false)
     }
@@ -246,7 +247,6 @@ export class NetworkAPI {
     hubKey: string
     hubNetworkId: string
   }> {
-    console.log('handleAgentRegister')
     if (!state.key) {
       throw networkError('unauthorized', 'authentication required', false)
     }
@@ -278,10 +278,10 @@ export class NetworkAPI {
     state: State,
     path = 'hub/net/bind',
   ) {
-    const { bindingKind, ...profile } = request
+    const { bindingKind, admission, ...profile } = request
     if (bindingKind === 'machine') return this.handleAgentRegister(profile, sender, state)
     if (bindingKind === 'apple-app') return this.handleAppRegister(profile, state, path)
-    if (bindingKind === 'join') return this.handleJoinRegister(profile, sender, state)
+    if (bindingKind === 'join') return this.handleJoinRegister(profile, sender, state, admission)
     throw networkError('invalid_request', 'unsupported agent binding kind', false)
   }
 
@@ -294,11 +294,17 @@ export class NetworkAPI {
    * local hub-net agent proof, and unlike apple-app they are not the Hub
    * owner; hub-pro assigns permanent overlay addresses from the sender
    * context and the wireGuardKey the joiner bound to.
+   *
+   * A key that was never admitted must present `admission`: the direct
+   * bootstrap response signed by an agent that is currently bound to this
+   * network, naming this key and WireGuard key. Admitted keys re-bind without
+   * it (reconnects, agent restarts).
    */
   handleJoinRegister(
     profile: Omit<AgentProfile, 'key'>,
     sender: Sender,
     state: State,
+    admission?: DirectBootstrapResponse,
   ): {
     success: true
     profile: AgentProfile
@@ -318,6 +324,13 @@ export class NetworkAPI {
     if (existing && existing.wireGuardKey !== profile.wireGuardKey) {
       throw networkError('forbidden', 'profile WireGuard key is already bound', false)
     }
+    if (!this.registry.hasAllocation(state.key)) {
+      const inviter = admission && this.agents.getProfile(admission.inviterServiceKey)
+      if (!admission || !inviter || admission.inviterServiceKey === state.key
+        || !validateJoinAdmission(admission, state.key, profile.wireGuardKey)) {
+        throw networkError('forbidden', 'a valid invitation admission is required to join', false)
+      }
+    }
     return this.registerAuthenticatedProfile(profile, state)
   }
 
@@ -335,7 +348,6 @@ export class NetworkAPI {
     hubKey: string
     hubNetworkId: string
     } {
-    console.log('handleAppRegister', profile)
     if (!this.security.isOwner(state.key)) {
       throw networkError('forbidden', `owner permission required for ${path}`, false)
     }
@@ -347,7 +359,6 @@ export class NetworkAPI {
     state: State,
     path = 'hub/net/apple-agent/bind',
   ): LocalAgentBindingStatus {
-    console.log('bindAppleAppAgent')
     if (request.version !== HUB_NETWORK_WIRE_VERSION) {
       throw networkError('unsupported_version', 'unsupported Apple app-agent version', false)
     }
@@ -359,7 +370,6 @@ export class NetworkAPI {
     state: State,
     path = 'hub/net/apple-agent/renew',
   ): LocalAgentBindingStatus {
-    console.log('renewAppleAppAgent')
     if (request.version !== HUB_NETWORK_WIRE_VERSION) {
       throw networkError('unsupported_version', 'unsupported Apple app-agent version', false)
     }
@@ -371,7 +381,6 @@ export class NetworkAPI {
     state: State,
     path = 'hub/net/apple-agent/unbind',
   ): LocalAgentBindingStatus {
-    console.log('unbindAppleAppAgent')
     this.security.requireOwner(state.key, path)
     if (request.version !== HUB_NETWORK_WIRE_VERSION) {
       throw networkError('unsupported_version', 'unsupported Apple app-agent version', false)
@@ -396,7 +405,6 @@ export class NetworkAPI {
     path: string,
     renew: boolean,
   ): LocalAgentBindingStatus {
-    console.log('updateAppleAppAgent')
     this.security.requireOwner(state.key, path)
     const profile = this.authenticatedProfile(state)
     const { hubNetworkId } = this.registry.getIdentity()
@@ -432,7 +440,6 @@ export class NetworkAPI {
     hubKey: string
     hubNetworkId: string
     } {
-    console.log('registerAuthenticatedProfile')
     if (!state.key) {
       throw networkError('unauthorized', 'authentication required', false)
     }
@@ -445,7 +452,10 @@ export class NetworkAPI {
 
     const addresses = this.registry.allocateAddresses(state.key)
     const registered: AgentProfile = {
-      ...profile,
+      version: profile.version,
+      wireGuardKey: profile.wireGuardKey,
+      name: typeof profile.name === 'string' ? profile.name : undefined,
+      platform: typeof profile.platform === 'string' ? profile.platform : undefined,
       key: state.key,
       overlayAddresses: [addresses.ipv4, addresses.ipv6],
       connectedAt: new Date().toISOString(),
@@ -470,7 +480,6 @@ export class NetworkAPI {
     preferredProviderId: string | undefined,
     state: State,
   ): Promise<ConnectionGrant> {
-    console.log('issueConnectionGrant')
     if (!state.key) {
       throw networkError('unauthorized', 'authentication required', false)
     }
@@ -567,7 +576,6 @@ export class NetworkAPI {
     roles: string[],
     state: State,
   ): Promise<RendezvousTicket> {
-    console.log('issueRendezvousTicket')
     if (!state.key) {
       throw networkError('unauthorized', 'authentication required', false)
     }
@@ -607,7 +615,6 @@ export class NetworkAPI {
   }
 
   advertiseGateway(capability: GatewayCapability, endpoint: string, state: State): GatewayStatus {
-    console.log('advertiseGateway')
     const profile = this.authenticatedProfile(state)
     if (
       capability?.version !== HUB_NETWORK_WIRE_VERSION
@@ -643,7 +650,6 @@ export class NetworkAPI {
   }
 
   removeGateway(reason: string, state: State): GatewayRevocation {
-    console.log('removeGateway')
     const profile = this.authenticatedProfile(state)
     const current = this.gateways.get(profile.key)
     if (!current || current.connectionId !== state.id) {
@@ -653,13 +659,11 @@ export class NetworkAPI {
   }
 
   listGateways(state: State): GatewayStatus[] {
-    console.log('listGateways')
     if (!this.canUseGatewayAPI(state)) return []
     return [...this.gateways.values()].map(value => value.status)
   }
 
   listGatewayRevocations(state: State): GatewayRevocation[] {
-    console.log('listGatewayRevocations')
     if (!state.key) return []
     const profile = this.agents.getProfile(state.key)
     if (!profile && !this.security.isOwner(state.key)) return []
@@ -671,7 +675,6 @@ export class NetworkAPI {
   }
 
   listGatewayDiagnostics(state: State): GatewayDiagnostic[] {
-    console.log('listGatewayDiagnostics')
     if (!this.canUseGatewayAPI(state)) return []
     return []
   }
@@ -683,7 +686,6 @@ export class NetworkAPI {
     requested: { ipv4: boolean; ipv6: boolean; dns: boolean },
     state: State,
   ): Promise<GatewayGrant> {
-    console.log('issueGatewayGrant')
     const client = this.authenticatedProfile(state)
     if (client.key !== clientKey || client.wireGuardKey !== clientWireGuardKey) {
       throw networkError('gateway_not_authorized', 'client binding does not match authenticated profile', false)
@@ -729,7 +731,6 @@ export class NetworkAPI {
   }
 
   private authenticatedProfile(state: State): AgentProfile {
-    console.log('authenticatedProfile')
     if (!state.key) throw networkError('unauthorized', 'authentication required', false)
     const profile = this.agents.getProfile(state.key)
     if (!profile || profile.key !== state.key) {
@@ -739,12 +740,10 @@ export class NetworkAPI {
   }
 
   private canUseGatewayAPI(state: State): boolean {
-    console.log('canUseGatewayAPI')
     return !!state.key && (this.security.isOwner(state.key) || !!this.agents.getProfile(state.key))
   }
 
   private revokeGateway(key: string, reason: string): GatewayRevocation {
-    console.log('revokeGateway')
     const current = this.gateways.get(key)
     this.gateways.delete(key)
     const generation = (this.gatewayGenerations.get(key) ?? current?.generation ?? 0) + 1
@@ -777,7 +776,6 @@ export class NetworkAPI {
     policy: NetworkPolicy,
     state: State,
   ): number {
-    console.log('updateResourcePolicy')
     if (!state.key) {
       throw networkError('unauthorized', 'authentication required', false)
     }
@@ -808,7 +806,6 @@ export class NetworkAPI {
    * grants issued against the previous generation.
    */
   revokeResource(resourceId: string, state: State): number {
-    console.log('revokeResource')
     if (!state.key) {
       throw networkError('unauthorized', 'authentication required', false)
     }
@@ -834,7 +831,6 @@ export class NetworkAPI {
    * subsequent issuance is re-evaluated against the updated membership.
    */
   handleGroupMembershipChanged(group: string): void {
-    console.log('handleGroupMembershipChanged')
     for (const resource of Object.values(this.registry.data.resources)) {
       if (resource.policy.mode !== 'group' || resource.policy.group !== group) continue
       this.registry.incrementGeneration(resource.resourceId)
@@ -844,7 +840,6 @@ export class NetworkAPI {
   }
 
   handleGroupRenamed(group: string, name: string): void {
-    console.log('handleGroupRenamed')
     for (const resource of Object.values(this.registry.data.resources)) {
       if (resource.policy.mode !== 'group' || resource.policy.group !== group) continue
       const policy: NetworkPolicy = { mode: 'group', group: name }
@@ -865,7 +860,6 @@ export class NetworkAPI {
    * generation.
    */
   private propagateGeneration(resourceId: string): void {
-    console.log('propagateGeneration')
     const resource = this.registry.getResource(resourceId)
     if (!resource) return
     const updatedAt = new Date().toISOString()
@@ -886,7 +880,6 @@ export class NetworkAPI {
    * List resources filtered by permissions.
    */
   listResources(state: State): NetworkResource[] {
-    console.log('listResources')
     return Object.values(this.registry.data.resources).filter(resource => this.canViewResource(resource, state))
   }
 
@@ -894,7 +887,6 @@ export class NetworkAPI {
    * List agents filtered by permissions.
    */
   listAgents(state: State): AgentProfile[] {
-    console.log('listAgents')
     const isHubOwner = this.security.isOwner(state.key ?? '')
     if (isHubOwner) {
       return this.agents.listProfiles()
@@ -915,7 +907,6 @@ export class NetworkAPI {
    * List live providers for a resource.
    */
   listProviders(resourceId: string, state: State): LiveProvider[] {
-    console.log('listProviders')
     const resource = this.registry.getResource(resourceId)
     if (!resource) {
       throw networkError('resource_unavailable', 'resource does not exist', false)
@@ -932,7 +923,6 @@ export class NetworkAPI {
    * List every provider whose resource is visible to the caller.
    */
   listVisibleProviders(state: State): LiveProvider[] {
-    console.log('listVisibleProviders')
     const visibleResources = new Set(this.listResources(state).map(resource => resource.resourceId))
     return this.agents.providers
       .map(provider => provider)
@@ -943,7 +933,6 @@ export class NetworkAPI {
    * Get agent status for all agents.
    */
   getAgentStatus(state: State): import('./wire').AgentStatus[] {
-    console.log('getAgentStatus')
     const isHubOwner = this.security.isOwner(state.key ?? '')
     if (isHubOwner) {
       return this.agents.listAgentStatus()
@@ -962,7 +951,6 @@ export class NetworkAPI {
    * that the resource or provider exists.
    */
   getConnectionStatus(state: State): import('./wire').ConnectionStatus[] {
-    console.log('getConnectionStatus')
     const visibleResources = new Set(this.listResources(state).map(resource => resource.resourceId))
     return this.agents.listConnectionStatus().filter(status => visibleResources.has(status.resourceId))
   }
@@ -973,12 +961,10 @@ export class NetworkAPI {
    * metadata from being exposed through the failure stream.
    */
   getDiagnostics(state: State): import('./wire').ConnectionStatus[] {
-    console.log('getDiagnostics')
     return this.getConnectionStatus(state).filter(status => status.phase === 'failed' && status.error)
   }
 
   private canViewResource(resource: NetworkResource, state: State): boolean {
-    console.log('canViewResource')
     if (!state.key) return false
     if (resource.ownerKey === state.key || this.security.isOwner(state.key)) return true
 
@@ -997,7 +983,6 @@ export class NetworkAPI {
    * disconnect.
    */
   currentGenerations(state: State): ResourceGenerationSnapshot[] {
-    console.log('currentGenerations')
     if (!state.key) return []
     const profile = this.agents.getProfile(state.key)
     if (!profile) return []
@@ -1008,7 +993,6 @@ export class NetworkAPI {
    * Handle disconnection - cleanup agent profile and providers.
    */
   handleDisconnect(state: State): void {
-    console.log('handleDisconnect')
     for (const [key, gateway] of this.gateways) {
       if (gateway.connectionId === state.id) this.revokeGateway(key, 'provider_disconnected')
     }
@@ -1035,7 +1019,6 @@ export class NetworkAPI {
     serviceKey: string,
     agentProfile: AgentProfile,
   ): boolean {
-    console.log('verifyAttestation')
     if (attestation.version !== HUB_NETWORK_WIRE_VERSION) return false
     const now = Date.now()
     const issuedAt = Date.parse(attestation.issuedAt)
@@ -1067,7 +1050,6 @@ export class NetworkAPI {
   }
 
   private validateShare(share: NetworkShare): void {
-    console.log('validateShare')
     if (
       share?.version !== HUB_NETWORK_WIRE_VERSION
       || (share.protocol !== 'tcp' && share.protocol !== 'udp')
@@ -1090,7 +1072,6 @@ export class NetworkAPI {
   }
 
   private pruneConsumedAttestations(now: number): void {
-    console.log('pruneConsumedAttestations')
     for (const [id, expiresAt] of this.consumedAttestations) {
       if (expiresAt <= now) this.consumedAttestations.delete(id)
     }
@@ -1104,7 +1085,6 @@ export function createMessage<TType extends HubNetworkMessage['type'], TPayload>
   type: TType,
   payload: TPayload,
 ): WireEnvelope<TType, TPayload> {
-  console.log('createMessage')
   return {
     version: HUB_NETWORK_WIRE_VERSION,
     type,

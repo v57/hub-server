@@ -87,6 +87,11 @@ export class NetworkRegistry {
     return { ipv4, ipv6 }
   }
 
+  /** Whether the key was ever admitted, i.e. holds an address allocation. */
+  hasAllocation(key: string): boolean {
+    return this.data.allocations[key] !== undefined
+  }
+
   /**
    * Release addresses when a profile is disconnected.
    * Addresses remain reserved to the profile for stability.

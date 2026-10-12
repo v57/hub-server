@@ -50,6 +50,29 @@ export interface AgentProfile extends Versioned {
 
 export interface AgentBindRequest extends Omit<AgentProfile, 'key'> {
   bindingKind: LocalAgentBindingKind
+  /** Required for a first `join` bind: the inviter-signed bootstrap response. */
+  admission?: DirectBootstrapResponse
+}
+
+/**
+ * Inviter-signed answer to a joiner's direct bootstrap request
+ * (`hub-network/direct-bootstrap-response/v1`). A joiner presents it with its
+ * first `join` bind as proof that a current agent of this network invited it.
+ */
+export interface DirectBootstrapResponse extends Versioned {
+  signatureDomain: 'hub-network/direct-bootstrap-response/v1'
+  replayId: string
+  inviterServiceKey: string
+  joinerServiceKey: string
+  joinerWireGuardKey: string
+  inviterWireGuardKey: string
+  endpoints: { address: string; port: number; transport: 'udp' }[]
+  joinerAddress: { ipv4: string; ipv6: string }
+  inviterAddress: { ipv4: string; ipv6: string }
+  hubProHost: string
+  issuedAt: Timestamp
+  expiresAt: Timestamp
+  signature: string
 }
 
 export type LocalAgentBindingKind = 'machine' | 'apple-app' | 'join'
