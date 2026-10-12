@@ -1,3 +1,19 @@
 node_modules/
 .DS_Store
 data/
+
+# macOS
+# Finder folder icon: a file named Icon plus a carriage return
+Icon[]
+
+# Secrets
+.env
+
+# Agents (local agent instructions, settings and boards)
+CLAUDE.md
+AGENTS.md
+.claude/
+.codex/
+.commandcode/
+.hermes/
+KANBAN*.md
