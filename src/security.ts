@@ -147,6 +147,16 @@ export class Security implements SecurityInterface {
     if (!user) return
     return this.group.users.group(user)
   }
+  isOwner(user: string | undefined): boolean {
+    if (!user) return false
+    return this.owners.has(user)
+  }
+  registerProtectedApis(apis: Record<string, string>): void {
+    for (const [path, name] of Object.entries(apis)) {
+      ownerApi.add(path)
+      this.group.names.register(path, name)
+    }
+  }
 }
 
 class Keys {
@@ -297,14 +307,16 @@ class Group {
     return this.groups.has(group, path)
   }
   create(group: string): void {
-    const paths = this.groups.get(group)
-    if (!paths) {
+    if (!this.groups.hasKey(group)) {
       this.groups.replace(group, new Set())
       this.subscription.setNeedsUpdate()
+      this.storage.save()
     }
   }
   remove(group: string): void {
-    if (this.groups.deleteAll(group)) {
+    const removed = this.groups.deleteAll(group)
+    this.users.removeGroup(group)
+    if (removed) {
       this.subscription.setNeedsUpdate()
       this.storage.save()
     }
@@ -419,6 +431,15 @@ class GroupNames {
       this.paths.set(name, path)
     })
   }
+  register(path: string, name: string): void {
+    const oldName = this.names.get(path)
+    if (oldName === name && this.restricted.has(path)) return
+    if (oldName) this.paths.delete(oldName, path)
+    this.names.set(path, name)
+    this.paths.set(name, path)
+    this.restricted.add(path)
+    this.subscription.setNeedsUpdate()
+  }
   add(path: string, name: string): void {
     const oldName = this.names.get(path)
     if (oldName) this.paths.delete(oldName, path)
@@ -524,6 +545,9 @@ class MapSet<Value> {
     const set = this.content.get(key)
     if (!set) return false
     return set.has(value)
+  }
+  hasKey(key: string): boolean {
+    return this.content.get(key) !== undefined
   }
   get(key: string): Set<Value> {
     return this.content.get(key) ?? new Set<Value>()
