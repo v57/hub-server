@@ -46,6 +46,8 @@ export interface AgentProfile extends Versioned {
   platform?: string
   overlayAddresses: string[]
   connectedAt: Timestamp
+  /** Set in member lists: false for a known member that is not connected. */
+  online?: boolean
 }
 
 export interface AgentBindRequest extends Omit<AgentProfile, 'key'> {

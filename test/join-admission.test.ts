@@ -94,4 +94,19 @@ describe('hub/net/bind join', () => {
     const again = await api.bindAgent(request(), {} as never, state(joinerKey, 'joiner-reconnected'))
     expect(again.profile.overlayAddresses).toEqual((await api.bindAgent(request(), {} as never, state(joinerKey, 'x'))).profile.overlayAddresses)
   })
+
+  test('keeps a disconnected member in the member list', async () => {
+    const api = withInviter()
+    const realNow = Date.now
+    Date.now = () => issuedAt + 1000
+    try {
+      await api.bindAgent(request(admission), {} as never, state(joinerKey, 'joiner'))
+    } finally {
+      Date.now = realNow
+    }
+    api.agents.unregisterProfile(joinerKey)
+    const member = api.listMembers().find(profile => profile.key === joinerKey)
+    expect(member).toMatchObject({ online: false, wireGuardKey: joinerWireGuardKey })
+    expect(member?.overlayAddresses).toHaveLength(2)
+  })
 })

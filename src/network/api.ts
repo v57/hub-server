@@ -461,6 +461,12 @@ export class NetworkAPI {
       connectedAt: new Date().toISOString(),
     }
     this.agents.registerProfile(registered, state.id)
+    this.registry.rememberMember(state.key, {
+      wireGuardKey: registered.wireGuardKey,
+      name: registered.name,
+      platform: registered.platform,
+      lastSeen: registered.connectedAt,
+    })
     this.onStateChanged?.()
     const { hubKey, hubNetworkId } = this.registry.getIdentity()
     return {
@@ -886,13 +892,36 @@ export class NetworkAPI {
   /**
    * List agents filtered by permissions.
    */
+  /**
+   * Every member: connected profiles plus known members that are offline, so
+   * the hub host's agent keeps their peers across restarts (a member can only
+   * reconnect through that peer).
+   */
+  listMembers(): AgentProfile[] {
+    const connected = this.agents.listProfiles()
+    const keys = new Set(connected.map(profile => profile.key))
+    const offline = this.registry.listMembers()
+      .filter(({ key }) => !keys.has(key))
+      .map(({ key, member, addresses }): AgentProfile => ({
+        version: HUB_NETWORK_WIRE_VERSION,
+        key,
+        wireGuardKey: member.wireGuardKey,
+        name: member.name,
+        platform: member.platform,
+        overlayAddresses: addresses,
+        connectedAt: member.lastSeen,
+        online: false,
+      }))
+    return [...connected.map(profile => ({ ...profile, online: true })), ...offline]
+  }
+
   listAgents(state: State): AgentProfile[] {
     // The owner and the hub host's own agent see every member: the agent keeps
     // a WireGuard peer per member and enforces their port grants.
     const isHubOwner = this.security.isOwner(state.key ?? '')
     const isLocalAgent = !!state.key && this.localAgent.binding('machine')?.key === state.key
     if (isHubOwner || isLocalAgent) {
-      return this.agents.listProfiles()
+      return this.listMembers()
     }
 
     const visibleKeys = new Set(this.listVisibleProviders(state).map(provider => provider.key))

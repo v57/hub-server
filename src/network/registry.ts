@@ -87,6 +87,26 @@ export class NetworkRegistry {
     return { ipv4, ipv6 }
   }
 
+  /** Records the member's current WireGuard key so its peer survives restarts. */
+  rememberMember(key: string, member: StoredMember): void {
+    const previous = this.data.members[key]
+    if (previous?.wireGuardKey === member.wireGuardKey && previous.name === member.name
+      && previous.platform === member.platform) {
+      previous.lastSeen = member.lastSeen
+      return
+    }
+    this.data.members[key] = member
+    this.storage.save()
+  }
+
+  /** Members with a stored WireGuard key and an allocation. */
+  listMembers(): { key: string; member: StoredMember; addresses: string[] }[] {
+    return Object.entries(this.data.members).flatMap(([key, member]) => {
+      const addresses = this.data.allocations[key]
+      return addresses ? [{ key, member, addresses }] : []
+    })
+  }
+
   /** Whether the key was ever admitted, i.e. holds an address allocation. */
   hasAllocation(key: string): boolean {
     return this.data.allocations[key] !== undefined
@@ -635,6 +655,7 @@ function defaultRegistryData(): RegistryData {
     lastIPv6: parseAddress(OVERLAY_RANGES.ipv6.last).toString(),
     resources: {},
     allocations: {},
+    members: {},
   }
 }
 
@@ -646,6 +667,7 @@ function migrateRegistryData(data: Partial<RegistryData> | undefined): RegistryD
     schemaVersion: REGISTRY_SCHEMA_VERSION,
     resources: data?.resources ?? {},
     allocations: data?.allocations ?? {},
+    members: data?.members ?? {},
   }
 }
 
@@ -675,4 +697,13 @@ export interface RegistryData {
   lastIPv6: string // BigInt as string for JSON serialization
   resources: Record<string, NetworkResource>
   allocations: Record<string, string[]>
+  /** Last bound WireGuard key and labels per member, kept while offline. */
+  members: Record<string, StoredMember>
+}
+
+export interface StoredMember {
+  wireGuardKey: string
+  name?: string
+  platform?: string
+  lastSeen: string
 }
