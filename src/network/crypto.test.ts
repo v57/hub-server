@@ -26,12 +26,13 @@ describe('Hub Network cryptographic vectors', () => {
   }
 
   test('uses a different signature domain for every purpose', () => {
-    expect(new Set(Object.values(SIGNATURE_DOMAINS)).size).toBe(4)
+    const purposes = Object.keys(SIGNATURE_DOMAINS).length
+    expect(new Set(Object.values(SIGNATURE_DOMAINS)).size).toBe(purposes)
     const envelope = vectors.vectors[0].envelope
     const signatures = Object.keys(SIGNATURE_DOMAINS).map(purpose =>
       signEnvelope(purpose as SignaturePurpose, envelope, privateKey),
     )
-    expect(new Set(signatures).size).toBe(4)
+    expect(new Set(signatures).size).toBe(purposes)
   })
 
   test('rejects mutation and cross-purpose replay', () => {

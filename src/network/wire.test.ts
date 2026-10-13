@@ -24,7 +24,7 @@ describe('Hub Network wire models', () => {
               version: 1,
               attestationId: 'att-1',
               serviceKey: 'service-key',
-              agentKey: 'agent-key',
+              key: 'agent-key',
               shareName: 's3',
               protocol: 'tcp',
               target: { host: '127.0.0.1', port: 9001 },

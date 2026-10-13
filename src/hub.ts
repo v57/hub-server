@@ -8,6 +8,15 @@ import * as LoadBalancer from './load balancers.ts'
 import type { Cancellable } from 'channel/channel'
 import { Security } from './security.ts'
 import { randomUUIDv7 } from 'bun'
+import {
+  appleAgentAPIsEnabled,
+  appleAgentProtectedApi,
+  networkProtectedApi,
+  registerNetworkAPIs,
+} from './network/hub'
+import { NetworkAPI } from './network/api'
+import { HubHeaderStore, registerHubHeaderAPIs } from './header'
+import { HubNetNodeStore } from './network/node-store'
 
 export type { Sender } from 'channel/client'
 
@@ -15,18 +24,23 @@ export const security = await new Security().load()
 
 const paddr = (a?: string) => (a ? (isNaN(Number(a)) ? a : Number(a)) : 1997)
 
-interface State {
+export interface State {
   id: string
   key?: string
   name?: string
   icon?: any
   services: Set<string>
   apps: Set<string>
+  ip?: string
 }
 
 interface ServiceProvider {
   id: string
   name?: string
+}
+interface HubNetInfo {
+  id: string
+  localIp: string
 }
 
 let requests = 0
@@ -38,6 +52,10 @@ export class Hub {
   proxies = new Map<string, Sender>()
   apps = new Apps()
   api = new Set<string>()
+  networkAPI?: NetworkAPI
+  header = new HubHeaderStore()
+  hubNetNode = new HubNetNodeStore()
+  ready: Promise<void>
   apiList = new LazyStates<State, string[]>(state => {
     return security.allowedApi(state.key, this.api)
   })
@@ -58,13 +76,42 @@ export class Hub {
     }))
     const connectionsState = new LazyState(() => this.connectionsInfo()).delay(1)
     const statusBadges = new LazyState<StatusBadges>(() => this.statusBadges)
+    const hubNetList = new LazyState<HubNetInfo[]>(() => {
+      const providers = this.services.get('net/invite')?.services ?? []
+      return providers.flatMap(provider => provider.state.key ? [{
+        id: provider.state.key,
+        localIp: provider.state.ip === '::1' ? '127.0.0.1' : (provider.state.ip ?? ''),
+      }] : [])
+    }).delay(1)
+    const hubNetNode = new LazyState(() => this.hubNetNode.value)
     const sendUpdates = () => {
       statusState.setNeedsUpdate()
       statusBadges.setNeedsUpdate()
       this.serviceProviders.setNeedsUpdate()
+      hubNetList.setNeedsUpdate()
+      this.apiList.setNeedsUpdate()
     }
+    const appleAgentEnabled = appleAgentAPIsEnabled()
+    security.registerProtectedApis({
+      ...networkProtectedApi,
+      ...(appleAgentEnabled ? appleAgentProtectedApi : {}),
+    })
+    const networkAPI = new NetworkAPI(security)
+    this.networkAPI = registerNetworkAPIs(this.channel, security, networkAPI, appleAgentEnabled)
+    registerHubHeaderAPIs(this.channel, security, this.header)
+    this.ready = Promise.all([networkAPI.load(), this.header.load(), this.hubNetNode.load()]).then(() => {
+      hubNetNode.setNeedsUpdate()
+    })
+
     this.channel
       .post('hub/api', ({ state }) => security.allowedApi(state.key, this.api))
+      .stream('hub/net/list', () => hubNetList.makeIterator())
+      .stream('hub/net/node', () => hubNetNode.makeIterator())
+      .post('hub/net/node/set', async ({ body, state, path }) => {
+        security.requireOwner(state.key, path)
+        await this.hubNetNode.set(body)
+        hubNetNode.setNeedsUpdate()
+      })
       .post('hub/profile/update', ({ body: { name, icon }, state }) => {
         if (icon) state.icon = icon
         if (name) state.name = name
@@ -200,11 +247,13 @@ export class Hub {
       .post('hub/group/rename', async ({ body: { group, name }, state, path }) => {
         security.requireOwner(state.key, path)
         security.group.rename(group, name)
+        this.networkAPI?.handleGroupRenamed(group, name)
         connectionsState.setNeedsUpdate()
       })
       .post('hub/group/remove', async ({ body: group, state, path }) => {
         security.requireOwner(state.key, path)
         security.group.remove(group)
+        this.networkAPI?.handleGroupMembershipChanged(group)
       })
       .post('hub/group/update', async ({ body: { group, add, remove, set }, state, path }) => {
         security.requireOwner(state.key, path)
@@ -217,6 +266,7 @@ export class Hub {
       .post('hub/group/update/users', async ({ body: { group, add, remove }, state, path }) => {
         security.requireOwner(state.key, path)
         security.group.users.edit(group, add, remove)
+        this.networkAPI?.handleGroupMembershipChanged(group)
         const users = security.group.users.users(group)
         let changes = 0
         const context = this.merger.context()
@@ -323,8 +373,10 @@ export class Hub {
         statusState.setNeedsUpdate()
         this.serviceProviders.setNeedsUpdate()
         if (sendUpdates) statusBadges.setNeedsUpdate()
+        // Cleanup network agent profile and providers
+        this.networkAPI?.handleDisconnect(state)
       })
-      .listen(address, {
+    this.ready.then(() => this.channel.listen(address, {
         async state(headers: Record<string, string | undefined>): Promise<State> {
           const key = security.keys.verify(headers['auth'] ?? undefined, security.whitelist)
           return {
@@ -332,6 +384,7 @@ export class Hub {
             key,
             services: new Set<string>(),
             apps: new Set<string>(),
+            ip: headers['x-hub-remote-ip'],
           }
         },
         onConnect: (connection: BodyContext<State>) => {
@@ -344,7 +397,7 @@ export class Hub {
           connectionsState.setNeedsUpdate()
           statusBadges.setNeedsUpdate()
         },
-      })
+      }))
 
     this.api = new Set([...Object.keys(this.channel.postApi.storage), ...Object.keys(this.channel.streamApi.storage)])
     settings.data.merge.forEach(address => this.merger.connect(address, this))
@@ -464,7 +517,7 @@ class Services {
     }
   }
   select(id: string): Service | undefined {
-    return this.services.find(service => service.state.id === id)
+    return this.services.find(service => service.state.key === id || service.state.id === id)
   }
   allowKey(key: string, context: ServiceUpdateContext): number {
     let enabled = new Set<Service>()

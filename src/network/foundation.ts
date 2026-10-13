@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import type { ResourceId } from './wire'
 
 export const NETWORK_PROTOCOL_VERSION = 1 as const
 export const NETWORK_DNS_SUFFIX = 'hub.invalid' as const
@@ -60,7 +61,7 @@ export function normalizeShareName(name: string): string {
   return normalized
 }
 
-export function stableResourceId(ownerKey: string, shareName: string): string {
+export function stableResourceId(ownerKey: string, shareName: string): ResourceId {
   return `hnr1_${base32(digest('hub-network/resource/v1', normalizeKey(ownerKey), normalizeShareName(shareName))).slice(0, 32)}`
 }
 
@@ -79,4 +80,3 @@ export function canonicalAuthority(hubNetworkId: string, ownerKey: string, share
   const hub = base32(digest('hub-network/authority-hub/v1', hubNetworkId)).slice(0, 16)
   return `${displayLabel(shareName)}-${resource}.v1-${hub}.${NETWORK_DNS_SUFFIX}`
 }
-
