@@ -113,6 +113,18 @@ export class Hub {
     const networkAPI = new NetworkAPI(security)
     this.networkAPI = registerNetworkAPIs(this.channel, security, networkAPI, appleAgentEnabled)
     registerHubHeaderAPIs(this.channel, security, this.header)
+    // Hub Network members are devices: binding approves the device, removing it removes the member
+    const networkStateChanged = networkAPI.onStateChanged
+    networkAPI.onStateChanged = () => {
+      networkStateChanged?.()
+      this.devices.devicesState.setNeedsUpdate()
+    }
+    networkAPI.onBindApprove = state => {
+      if (state.certificate) this.devices.approve(state.certificate.deviceId)
+    }
+    networkAPI.deviceLabel = id => this.devices.registry.device(id)?.name
+    this.devices.networkState = id => networkAPI.deviceNetworkState(id)
+    this.devices.onRemoved = ({ id, revokedKeys }) => networkAPI.removeDevice(id, revokedKeys)
     this.ready = Promise.all([
       networkAPI.load(),
       this.header.load(),

@@ -1,5 +1,5 @@
 import { randomUUIDv7 } from 'bun'
-import type { NetworkPolicy, NetworkResource, LiveProvider, AgentProfile, AgentStatus, ConnectionStatus, ResourceGenerationSnapshot } from './wire'
+import type { NetworkPolicy, NetworkResource, LiveProvider, AgentProfile, AgentStatus, ConnectionStatus, ResourceGenerationSnapshot, RevokedDevice } from './wire'
 import { Storage } from '../settings'
 import { ObjectMap } from 'channel/channel'
 import { OVERLAY_RANGES } from './foundation'
@@ -77,6 +77,8 @@ export class NetworkRegistry {
     while (nextIPv6 <= lastIPv6 && usedIPv6.has(formatAddress(nextIPv6))) nextIPv6++
 
     if (nextIPv4 > lastIPv4 || nextIPv6 > lastIPv6) {
+      const reused = this.reuseReleased(key)
+      if (reused) return reused
       throw new Error('overlay address exhausted')
     }
 
@@ -91,11 +93,61 @@ export class NetworkRegistry {
     return { ipv4, ipv6 }
   }
 
+  /** Addresses released more than a day ago, once the range is used up */
+  private reuseReleased(key: string): { ipv4: string; ipv6: string } | undefined {
+    const cutoff = Date.now() - RELEASED_ADDRESS_HOLD_MS
+    const entry = this.data.released.find(released => Date.parse(released.at) <= cutoff)
+    if (!entry) return
+    this.data.released.splice(this.data.released.indexOf(entry), 1)
+    const [ipv4, ipv6] = entry.addresses
+    this.data.allocations[key] = [ipv4, ipv6]
+    this.storage.save()
+    return { ipv4, ipv6 }
+  }
+
+  /** Moves a legacy member keyed by its service key to its device member key, keeping its addresses */
+  moveMember(from: string, to: string): void {
+    if (from === to || !this.data.allocations[from] || this.data.allocations[to]) return
+    this.data.allocations[to] = this.data.allocations[from]
+    delete this.data.allocations[from]
+    if (this.data.members[from]) {
+      this.data.members[to] = this.data.members[from]
+      delete this.data.members[from]
+    }
+    this.storage.save()
+  }
+
+  /** Forgets a member and releases its addresses for reuse after a day. Returns the stored member. */
+  removeMember(key: string): StoredMember | undefined {
+    const member = this.data.members[key]
+    const addresses = this.data.allocations[key]
+    delete this.data.members[key]
+    delete this.data.allocations[key]
+    if (addresses) this.data.released.push({ addresses, at: new Date().toISOString() })
+    if (member || addresses) this.storage.save()
+    return member
+  }
+
+  addRevokedDevice(revoked: RevokedDevice): void {
+    this.data.revokedDevices = this.data.revokedDevices.filter(entry => entry.device !== revoked.device)
+    this.data.revokedDevices.push(revoked)
+    this.storage.save()
+  }
+
+  /** A removed device that enrolled again is no longer refused as a peer */
+  clearRevokedDevice(device: string): boolean {
+    const count = this.data.revokedDevices.length
+    this.data.revokedDevices = this.data.revokedDevices.filter(entry => entry.device !== device)
+    if (count === this.data.revokedDevices.length) return false
+    this.storage.save()
+    return true
+  }
+
   /** Records the member's current WireGuard key so its peer survives restarts. */
   rememberMember(key: string, member: StoredMember): void {
     const previous = this.data.members[key]
     if (previous?.wireGuardKey === member.wireGuardKey && previous.name === member.name
-      && previous.platform === member.platform) {
+      && previous.platform === member.platform && previous.key === member.key) {
       previous.lastSeen = member.lastSeen
       return
     }
@@ -647,6 +699,7 @@ function formatAddress(num: bigint): string {
 }
 
 const REGISTRY_SCHEMA_VERSION = 1
+const RELEASED_ADDRESS_HOLD_MS = 24 * 60 * 60 * 1000
 
 function defaultRegistryData(): RegistryData {
   return {
@@ -660,6 +713,8 @@ function defaultRegistryData(): RegistryData {
     resources: {},
     allocations: {},
     members: {},
+    released: [],
+    revokedDevices: [],
   }
 }
 
@@ -672,6 +727,8 @@ function migrateRegistryData(data: Partial<RegistryData> | undefined): RegistryD
     resources: data?.resources ?? {},
     allocations: data?.allocations ?? {},
     members: data?.members ?? {},
+    released: data?.released ?? [],
+    revokedDevices: data?.revokedDevices ?? [],
   }
 }
 
@@ -703,9 +760,17 @@ export interface RegistryData {
   allocations: Record<string, string[]>
   /** Last bound WireGuard key and labels per member, kept while offline. */
   members: Record<string, StoredMember>
+  /** Addresses of removed members, reused a day later once the range runs out */
+  released: { addresses: string[]; at: string }[]
+  /** WireGuard keys of removed and revoked devices, for `network/devices/revoked` */
+  revokedDevices: RevokedDevice[]
 }
 
+/** Stored by member key: `device:<id>` for device-attached agents, else the agent's service key */
 export interface StoredMember {
+  /** The agent's service key, when it differs from the member key */
+  key?: string
+  device?: string
   wireGuardKey: string
   name?: string
   platform?: string

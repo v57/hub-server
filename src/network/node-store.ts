@@ -1,15 +1,14 @@
 import { mkdir, rename } from 'fs/promises'
 import { dirname } from 'path'
 
-export const DEFAULT_HUB_NET_NODE = 'hub.v57.dev/node'
-
+/** The Hub Network node agents use. There is no built-in node: `null` until an owner sets one. */
 export class HubNetNodeStore {
-  value = DEFAULT_HUB_NET_NODE
+  value: string | null = null
   private writeChain: Promise<void> = Promise.resolve()
 
   constructor(readonly path = 'data/hub-net-node.json') {}
 
-  async load(): Promise<string> {
+  async load(): Promise<string | null> {
     try {
       const stored = await Bun.file(this.path).json()
       this.value = validateNode(stored)
@@ -17,8 +16,8 @@ export class HubNetNodeStore {
     return this.value
   }
 
-  async set(input: unknown): Promise<string> {
-    const value = input === null ? DEFAULT_HUB_NET_NODE : validateNode(input)
+  async set(input: unknown): Promise<string | null> {
+    const value = input === null || input === undefined ? null : validateNode(input)
     const write = this.writeChain.then(async () => {
       await mkdir(dirname(this.path), { recursive: true })
       const temporaryPath = `${this.path}.${crypto.randomUUID()}.tmp`

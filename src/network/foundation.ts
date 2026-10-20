@@ -80,3 +80,10 @@ export function canonicalAuthority(hubNetworkId: string, ownerKey: string, share
   const hub = base32(digest('hub-network/authority-hub/v1', hubNetworkId)).slice(0, 16)
   return `${displayLabel(shareName)}-${resource}.v1-${hub}.${NETWORK_DNS_SUFFIX}`
 }
+
+/** DNS name of a device member: its label, 16 characters of the device id digest and the hub part of authorities */
+export function deviceAuthority(hubNetworkId: string, deviceId: string, deviceName: string): string {
+  const device = base32(digest('hub-network/device/v1', deviceId)).slice(0, 16)
+  const hub = base32(digest('hub-network/authority-hub/v1', hubNetworkId)).slice(0, 16)
+  return `${displayLabel(deviceName)}-${device}.v1-${hub}.${NETWORK_DNS_SUFFIX}`
+}

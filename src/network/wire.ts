@@ -48,6 +48,17 @@ export interface AgentProfile extends Versioned {
   connectedAt: Timestamp
   /** Set in member lists: false for a known member that is not connected. */
   online?: boolean
+  /** Device id when the member is a device */
+  device?: string
+  /** `<label>-<16>.v1-<hub>.hub.invalid`, resolving to the device's overlay address */
+  deviceName?: string
+}
+
+/** `network/devices/revoked`: peers agents must drop and refuse */
+export interface RevokedDevice {
+  device: string
+  wireGuardKeys: string[]
+  at: Timestamp
 }
 
 export interface AgentBindRequest extends Omit<AgentProfile, 'key'> {
@@ -355,6 +366,8 @@ export type NetworkErrorCode =
   | 'gateway_not_authorized'
   | 'rate_limited'
   | 'internal'
+  | 'device_endpoint_exists'
+  | 'share_device_mismatch'
 
 export interface NetworkError extends Versioned {
   code: NetworkErrorCode

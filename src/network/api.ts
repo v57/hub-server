@@ -22,6 +22,7 @@ import type {
   AppleAppAgentRenewRequest,
   LocalAgentBindingStatus,
   DirectBootstrapResponse,
+  RevokedDevice,
 } from './wire'
 import { networkError, HUB_NETWORK_WIRE_VERSION } from './wire'
 import {
@@ -35,7 +36,7 @@ import {
 } from './crypto'
 import { randomUUIDv7 } from 'bun'
 import { NetworkRegistry, AgentRegistry, NetworkPermissions } from './registry'
-import { stableResourceId, canonicalAuthority } from './foundation'
+import { stableResourceId, canonicalAuthority, deviceAuthority } from './foundation'
 import type { Sender } from 'channel/server'
 import type { State } from '../hub'
 import { publicKey, signChallenge } from '../keychain'
@@ -79,6 +80,10 @@ export class NetworkAPI {
   private gatewayGenerations = new Map<string, number>()
   private gatewayRevocations = new Map<string, GatewayRevocation>()
   private gatewayGrantAgents = new Map<string, Set<string>>()
+  /** Device of each connected agent key that bound from a device connection */
+  private agentDevices = new Map<string, string>()
+  /** Approves a pending device whose agent passed its bind proof (protocol.md section 10) */
+  onBindApprove: ((state: State) => void) | undefined
 
   constructor(
     private security: Security,
@@ -144,6 +149,14 @@ export class NetworkAPI {
       }
       if (!this.verifyAttestation(attestation, share.name, share.protocol, share.target, ownerKey, agentProfile)) {
         throw networkError('invalid_attestation', 'service attestation is invalid or expired', false, {
+          shareName: share.name,
+        })
+      }
+
+      // The share's address is the service's device: only that device's agent may front it
+      const agentDevice = this.agentDevices.get(attestation.key)
+      if (state.device && agentDevice && agentDevice !== state.device) {
+        throw networkError('share_device_mismatch', 'the agent runs on another device than the service', false, {
           shareName: share.name,
         })
       }
@@ -324,7 +337,7 @@ export class NetworkAPI {
     if (existing && existing.wireGuardKey !== profile.wireGuardKey) {
       throw networkError('forbidden', 'profile WireGuard key is already bound', false)
     }
-    if (!this.registry.hasAllocation(state.key)) {
+    if (!this.isMember(state)) {
       const inviter = admission && this.agents.getProfile(admission.inviterServiceKey)
       if (!admission || !inviter || admission.inviterServiceKey === state.key
         || !validateJoinAdmission(admission, state.key, profile.wireGuardKey)) {
@@ -450,7 +463,23 @@ export class NetworkAPI {
       throw networkError('invalid_request', 'WireGuard key is required', false)
     }
 
-    const addresses = this.registry.allocateAddresses(state.key)
+    // One agent per device. Its proof passed, so a pending device is approved and the member is the device.
+    const deviceId = state.certificate?.deviceId
+    if (deviceId) {
+      const stored = this.registry.data.members[deviceMemberKey(deviceId)]
+      const connected = [...this.agentDevices].some(([key, device]) => device === deviceId && key !== state.key)
+      if (connected || (stored && (stored.key ?? '') !== state.key)) {
+        throw networkError('device_endpoint_exists', 'this device already has a network endpoint', false)
+      }
+      if (!state.device) this.onBindApprove?.(state)
+    }
+    const memberKey = state.device ? deviceMemberKey(state.device) : state.key
+    if (state.device) {
+      this.registry.moveMember(state.key, memberKey)
+      this.agentDevices.set(state.key, state.device)
+      if (this.registry.clearRevokedDevice(state.device)) this.onRevokedDevicesChanged?.()
+    }
+    const addresses = this.registry.allocateAddresses(memberKey)
     const registered: AgentProfile = {
       version: profile.version,
       wireGuardKey: profile.wireGuardKey,
@@ -461,7 +490,8 @@ export class NetworkAPI {
       connectedAt: new Date().toISOString(),
     }
     this.agents.registerProfile(registered, state.id)
-    this.registry.rememberMember(state.key, {
+    this.registry.rememberMember(memberKey, {
+      ...(memberKey !== state.key ? { key: state.key, device: state.device } : {}),
       wireGuardKey: registered.wireGuardKey,
       name: registered.name,
       platform: registered.platform,
@@ -901,18 +931,83 @@ export class NetworkAPI {
     const connected = this.agents.listProfiles()
     const keys = new Set(connected.map(profile => profile.key))
     const offline = this.registry.listMembers()
-      .filter(({ key }) => !keys.has(key))
+      .filter(({ key, member }) => !keys.has(member.key ?? key))
       .map(({ key, member, addresses }): AgentProfile => ({
         version: HUB_NETWORK_WIRE_VERSION,
-        key,
+        key: member.key ?? key,
         wireGuardKey: member.wireGuardKey,
         name: member.name,
         platform: member.platform,
         overlayAddresses: addresses,
         connectedAt: member.lastSeen,
         online: false,
+        ...this.deviceFields(member.device, member.name),
       }))
-    return [...connected.map(profile => ({ ...profile, online: true })), ...offline]
+    const online = connected.map(profile => ({
+      ...profile,
+      online: true,
+      ...this.deviceFields(this.agentDevices.get(profile.key), profile.name),
+    }))
+    return [...online, ...offline]
+  }
+
+  private deviceFields(device: string | undefined, name: string | undefined): Pick<AgentProfile, 'device' | 'deviceName'> {
+    if (!device) return {}
+    const { hubNetworkId } = this.registry.getIdentity()
+    const label = this.deviceLabel?.(device) ?? name ?? 'device'
+    return { device, deviceName: deviceAuthority(hubNetworkId, device, label) }
+  }
+
+  /** Device names for member DNS names, set by the hub */
+  deviceLabel: ((device: string) => string | undefined) | undefined
+  onRevokedDevicesChanged: (() => void) | undefined
+
+  /** A member by its device or, for legacy agents, by its key */
+  private isMember(state: State): boolean {
+    if (state.key && this.registry.hasAllocation(state.key)) return true
+    const device = state.device ?? state.certificate?.deviceId
+    return !!device && this.registry.hasAllocation(deviceMemberKey(device))
+  }
+
+  /** `online` while the device's agent is bound, `offline` for a member that isn't, else undefined */
+  deviceNetworkState(device: string): 'online' | 'offline' | undefined {
+    if ([...this.agentDevices.values()].includes(device)) return 'online'
+    return this.registry.data.members[deviceMemberKey(device)] ? 'offline' : undefined
+  }
+
+  /**
+   * Removes the member of a removed or revoked device, and legacy members of its revoked keys, releasing their
+   * addresses. Their WireGuard keys go to `network/devices/revoked` so every agent drops them as peers.
+   */
+  removeDevice(device: string, revokedKeys: string[] = []): void {
+    const wireGuardKeys = new Set<string>()
+    for (const key of [deviceMemberKey(device), ...revokedKeys]) {
+      const member = this.registry.removeMember(key)
+      if (member) wireGuardKeys.add(member.wireGuardKey)
+    }
+    for (const [key, agentDevice] of [...this.agentDevices]) {
+      if (agentDevice !== device && !revokedKeys.includes(key)) continue
+      const profile = this.agents.getProfile(key)
+      if (profile) wireGuardKeys.add(profile.wireGuardKey)
+      this.agents.unregisterProfile(key)
+      this.agentDevices.delete(key)
+    }
+    for (const key of revokedKeys) {
+      const profile = this.agents.getProfile(key)
+      if (profile) wireGuardKeys.add(profile.wireGuardKey)
+      this.agents.unregisterProfile(key)
+    }
+    if (wireGuardKeys.size) {
+      this.registry.addRevokedDevice({ device, wireGuardKeys: [...wireGuardKeys], at: new Date().toISOString() })
+      this.onRevokedDevicesChanged?.()
+    }
+    this.onStateChanged?.()
+  }
+
+  /** The full revoked list for owners and bound agents */
+  revokedDevices(state: State): RevokedDevice[] {
+    if (!this.security.isOwner(state) && !(state.key && this.agents.getProfile(state.key))) return []
+    return this.registry.data.revokedDevices
   }
 
   listAgents(state: State): AgentProfile[] {
@@ -1031,6 +1126,7 @@ export class NetworkAPI {
     this.localAgent.disconnect(state.id)
     this.agents.unregisterProviderConnection(state.id)
     const removedKeys = this.agents.unregisterConnection(state.id)
+    for (const key of removedKeys) this.agentDevices.delete(key)
     if (state.key && removedKeys.has(state.key)) {
       for (const [resourceId, keys] of this.grantAgents) {
         keys.delete(state.key)
@@ -1109,6 +1205,8 @@ export class NetworkAPI {
     }
   }
 }
+
+const deviceMemberKey = (device: string) => `device:${device}`
 
 /**
  * Create network message envelopes.

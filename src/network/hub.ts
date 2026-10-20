@@ -262,6 +262,11 @@ export function registerNetworkAPIs(
     })()
   })
 
+  // Peers every agent must drop and refuse: members of removed and revoked devices
+  const revokedDevicesState = new LazyStates<State, Wire.RevokedDevice[]>(state => networkAPI.revokedDevices(state)).dedupe('json')
+  networkAPI.onRevokedDevicesChanged = () => revokedDevicesState.setNeedsUpdate()
+  channel.stream('network/devices/revoked', ({ state }) => revokedDevicesState.makeIterator(state))
+
   // Agent status stream
   const agentStatusState = new LazyStates<State, Wire.AgentStatus[]>(state => networkAPI.getAgentStatus(state))
   channel.stream('network/status/agents', ({ state }) => agentStatusState.makeIterator(state))
