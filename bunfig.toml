@@ -1,0 +1,3 @@
+[test]
+# Runs every test in a temporary directory, so nothing reads or writes the hub's own data/
+preload = ["./test/setup.ts"]

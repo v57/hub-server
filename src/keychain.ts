@@ -3,9 +3,11 @@ import { writeAtomically } from './settings'
 
 let loadedKey: Promise<string> | undefined
 
-export async function sign(expires: number = 10) {
+/** An `auth` token. With `hubKey` it's a v1 token that only works on that hub (send `v: "1"`). */
+export async function sign(expires: number = 10, hubKey?: string) {
   const data = `${Math.round(new Date().getTime() / 1000) + expires}`
-  const [key, signature] = await Promise.all([loadKey(), signChallenge(data)])
+  const signed = hubKey ? `hub1:${hubKey}:${data}` : data
+  const [key, signature] = await Promise.all([loadKey(), signChallenge(signed)])
   return `key.${getPublicKey(key)}.${signature}.${data}`
 }
 export async function signChallenge(data: string | Uint8Array): Promise<string> {

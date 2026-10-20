@@ -1,17 +1,17 @@
 import { ObjectMap } from 'channel/channel'
 import { createPublicKey, verify } from 'crypto'
-import { Storage } from './settings'
+import { Storage, settings, type SecurityMode } from './settings'
 import { LazyState } from 'channel/more'
 
 interface SecurityInterface {
   requireOwner(user: string | undefined, path: string): void
   addOwner(user: string): void
-  allowsCall(user: string | undefined, path: string): boolean
+  allowsCall(caller: Caller | string | undefined, path: string, isPublic?: boolean): boolean
   allowsHost(user: string | undefined, path: string): boolean
 
   // Keys
   keys: {
-    verify(signedKey: string | undefined, whitelist: Whitelist): string | undefined
+    verify(signedKey: string | undefined, whitelist: Whitelist, options?: TokenOptions): string | undefined
   }
 
   // Create api
@@ -97,6 +97,49 @@ const hubApi = {
 
 export const ownerApi = new Set(Object.keys(hubApi))
 
+/** Who may call a built-in API (protocol.md section 7) */
+export type BuiltinAccess = 'public' | 'auth' | 'reporter' | 'grant' | 'owner' | 'own'
+
+const publicBuiltins = new Set([
+  'hub/info',
+  'hub/profile/update',
+  'hub/service/update',
+  'hub/api',
+  'hub/status',
+  'hub/status/badges',
+  'hub/proxy/join',
+  'hub/header',
+])
+// `hub/net/bind` keeps the proof of its bind kind, `hub/net/node` tells agents where their node is
+const authBuiltins = new Set(['hub/api/services', 'hub/net/bind', 'hub/net/node'])
+const reporterBuiltins = new Set(['hub/device/describe', 'hub/device/data'])
+const grantBuiltins = new Set(['hub/devices', 'hub/devices/data'])
+
+/** Access of a built-in path, undefined for service paths. `own`: `network/*` checks its callers itself. */
+export function builtinAccess(path: string): BuiltinAccess | undefined {
+  if (path === 'network' || path.startsWith('network/')) return 'own'
+  if (path !== 'hub' && !path.startsWith('hub/')) return
+  if (publicBuiltins.has(path)) return 'public'
+  if (authBuiltins.has(path)) return 'auth'
+  if (reporterBuiltins.has(path)) return 'reporter'
+  if (grantBuiltins.has(path)) return 'grant'
+  return 'owner'
+}
+
+/** The caller as services see it in `context.hub.caller` */
+export interface Caller {
+  key?: string
+  device?: { id: string; name: string }
+  groups: string[]
+  owner: boolean
+  /** Key of the hub a merged request came through */
+  via?: string
+  /** The caller that hub reported, unverified */
+  claimed?: unknown
+}
+
+export const ownersGroup = 'owners'
+
 export class Security implements SecurityInterface {
   keys = new Keys()
   host = new Host()
@@ -105,6 +148,12 @@ export class Security implements SecurityInterface {
   owners = new Set<string>()
   launcher?: string
   whitelist = new Whitelist(user => this.owners.has(user))
+  /** This hub's own key, which v1 tokens are bound to */
+  hubKey?: string
+  mode: SecurityMode = 'default-allow'
+  requireV1 = false
+  /** A store that grants failed to load: only owners may call service paths until an owner sets the mode */
+  lockdown = false
 
   async load() {
     await Promise.all([
@@ -115,47 +164,108 @@ export class Security implements SecurityInterface {
       this.group.users.storage.load(),
       this.whitelist.storage.load(),
     ])
+    this.mode = settings.data.security.mode
+    this.requireV1 = settings.data.security.requireV1
+    // An empty path list or whitelist opens the hub, so a corrupt one locks it down instead
+    if (settings.storage.corrupt || this.group.names.storage.corrupt || this.whitelist.storage.corrupt) {
+      this.lockdown = true
+      this.setMode({ mode: 'default-deny' }, false)
+    }
     return this
   }
-  /** A security store failed to load: everything it would grant is denied, owners keep access */
-  get corrupt(): boolean {
-    return [
-      this.host.storage,
-      this.call.storage,
-      this.group.storage,
-      this.group.names.storage,
-      this.group.users.storage,
-      this.whitelist.storage,
-    ].some(storage => storage.corrupt)
+  /** `default-deny` while locked down */
+  get effectiveMode(): SecurityMode {
+    return this.lockdown ? 'default-deny' : this.mode
+  }
+  /** Changes and stores the mode. An owner setting it ends a lockdown. */
+  setMode(update: { mode?: SecurityMode; requireV1?: boolean }, endsLockdown = true) {
+    if (update.mode !== undefined && update.mode !== 'default-allow' && update.mode !== 'default-deny') throw 'invalid mode'
+    if (update.requireV1 !== undefined && typeof update.requireV1 !== 'boolean') throw 'invalid requireV1'
+    if (update.mode) this.mode = update.mode
+    if (update.requireV1 !== undefined) this.requireV1 = update.requireV1
+    if (endsLockdown) this.lockdown = false
+    settings.setSecurity({ mode: this.mode, requireV1: this.requireV1 })
   }
   requireOwner(user: string | undefined, path: string): void {
-    if (!this.allowsCall(user, path)) throw 'Permissions required'
+    if (!this.isOwner(user)) throw 'Permissions required'
   }
   addOwner(user: string): void {
     this.owners.add(user)
   }
-  allowsCall(user: string | undefined, path: string): boolean {
-    if (this.corrupt) return this.isOwner(user)
-    if (!this.group.allowsUser(user, path)) {
-      if (!user) return false
-      return this.call.allows(user, path) || this.owners.has(user)
+  /** Caller of a connection, `undefined` key for anonymous ones */
+  caller(key: string | undefined): Caller {
+    const groups = this.groups(key)
+    return { ...(key ? { key } : {}), groups, owner: groups.includes(ownersGroup) }
+  }
+  /** Every group the key belongs to, `owners` included */
+  groups(key: string | undefined): string[] {
+    if (!key) return []
+    const groups: string[] = []
+    const group = this.group.users.group(key)
+    if (group && group !== ownersGroup) groups.push(group)
+    if (this.owners.has(key)) groups.unshift(ownersGroup)
+    return groups
+  }
+  /**
+   * A call to a service path. Owners always; then grants (per-key call lists and group path lists); then in
+   * `default-deny` only paths the providing service marked public, in `default-allow` every path no group restricts.
+   */
+  allowsCall(caller: Caller | string | undefined, path: string, isPublic = false): boolean {
+    const c = typeof caller === 'object' ? caller : this.caller(caller)
+    if (c.owner) return true
+    if (this.lockdown) return false
+    if (this.granted(c, path)) return true
+    if (this.mode === 'default-deny') return isPublic
+    return !this.group.names.contains(path)
+  }
+  /** Whether a grant (per-key call list or a group's path list) names this path for the caller */
+  granted(caller: Caller, path: string): boolean {
+    if (caller.key && this.call.allows(caller.key, path)) return true
+    return caller.groups.some(group => this.group.lists(group, path))
+  }
+  /** Access check for a built-in path, throws `permissions required` */
+  checkBuiltin(caller: Caller, path: string, access = builtinAccess(path)) {
+    switch (access) {
+      case undefined:
+      case 'own':
+      case 'public':
+      // Handlers check that the caller is its device's reporter
+      case 'reporter':
+        return
+      case 'auth':
+        if (!caller.key) throw 'unauthorized'
+        return
+      case 'grant':
+        if (caller.owner || (!this.lockdown && this.granted(caller, path))) return
+        throw 'permissions required'
+      case 'owner':
+        if (caller.owner) return
+        throw 'permissions required'
     }
-    return true
+  }
+  allowsBuiltin(caller: Caller, path: string): boolean {
+    try {
+      this.checkBuiltin(caller, path)
+      return true
+    } catch {
+      return false
+    }
   }
   allowsHost(user: string | undefined, path: string): boolean {
     if (!user) return false
     if (path.startsWith('hub/')) return false
     if (this.launcher && path.startsWith('launcher/') && user === this.launcher) return true
     if (this.owners.has(user)) return true
-    if (this.corrupt) return false
     if (this.host.allows(user, path)) return true
     this.host.ask(user, path)
     return false
   }
-  allowedApi(user: string | undefined, api: Set<string>): string[] {
-    if (user && this.owners.has(user)) return Array.from(api)
-    if (this.corrupt) return []
-    return Array.from(api.difference(this.group.restricted(user)))
+  /** The paths of `api` this caller may call, for `hub/api` */
+  allowedApi(caller: Caller | string | undefined, api: Set<string>, isPublic: (path: string) => boolean = () => false): string[] {
+    const c = typeof caller === 'object' ? caller : this.caller(caller)
+    return Array.from(api).filter(path =>
+      builtinAccess(path) ? this.allowsBuiltin(c, path) : this.allowsCall(c, path, isPublic(path)),
+    )
   }
   userGroup(user: string | undefined): string | undefined {
     if (!user) return
@@ -178,21 +288,33 @@ export const authMaxLifetime = 5 * 60
 // Tolerated clock difference between signer and hub, in seconds
 export const authClockSkew = 30
 
+export interface TokenOptions {
+  /** The `v` header: missing or "0" signs the expiry, "1" signs `hub1:<hub key>:<expiry>` */
+  version?: string
+  hubKey?: string
+  requireV1?: boolean
+}
+
 class Keys {
-  verify(signedKey: string | undefined, whitelist: Whitelist): string | undefined {
+  verify(signedKey: string | undefined, whitelist: Whitelist, options: TokenOptions = {}): string | undefined {
+    const version = options.version ?? '0'
+    if (version !== '0' && version !== '1') throw 'unsupported version'
     if (!signedKey?.length) {
       if (whitelist.enforced) throw 'hub is not available'
       else return
     }
+    if (version === '0' && options.requireV1) throw 'unsupported version'
     const parts = signedKey.split('.')
     if (parts.length !== 4 || parts[0] !== 'key') throw 'invalid key'
     const [_, key, hash, time] = parts
     if (whitelist.enforced && !whitelist.allows(key)) throw 'hub is not available'
-    if (!this.verifyPub(key, hash, time)) throw 'invalid signature'
+    if (version === '1' && !options.hubKey) throw 'unsupported version'
+    const signed = version === '1' ? `hub1:${options.hubKey}:${time}` : time
+    if (!this.verifyPub(key, hash, time, signed)) throw 'invalid signature'
     return key
   }
   // Can handle around 38k verifications per second
-  private verifyPub(key: string, signature: string, time: string): boolean {
+  private verifyPub(key: string, signature: string, time: string, signed: string): boolean {
     // Signers write the expiry as decimal Unix seconds (now + 10 by default, 60 in Swift)
     if (!/^\d{1,12}$/.test(time)) throw 'invalid key'
     const expiry = Number(time)
@@ -200,7 +322,7 @@ class Keys {
     if (expiry + authClockSkew <= now) throw 'authorization expired'
     if (expiry > now + authMaxLifetime + authClockSkew) throw 'authorization expires too late'
     const pubKey = createPublicKey({ key: Buffer.from(key, 'base64'), format: 'der', type: 'spki' })
-    const verified = verify(null, Buffer.from(time), pubKey, Buffer.from(signature, 'base64'))
+    const verified = verify(null, Buffer.from(signed), pubKey, Buffer.from(signature, 'base64'))
     return verified
   }
 }
@@ -326,6 +448,10 @@ class Group {
   }
   allows(group: string, path: string): boolean {
     if (!this.names.contains(path)) return true
+    return this.groups.has(group, path)
+  }
+  /** Whether the group's path list names the path */
+  lists(group: string, path: string): boolean {
     return this.groups.has(group, path)
   }
   create(group: string): void {

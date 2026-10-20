@@ -6,7 +6,7 @@ import { settings } from './settings.ts'
 import { publicKey } from './keychain.ts'
 import * as LoadBalancer from './load balancers.ts'
 import type { Cancellable } from 'channel/channel'
-import { Security } from './security.ts'
+import { Security, builtinAccess, ownersGroup, type Caller } from './security.ts'
 import { randomUUIDv7 } from 'bun'
 import {
   appleAgentAPIsEnabled,
@@ -21,6 +21,7 @@ import { HubNetNodeStore } from './network/node-store'
 export type { Sender } from 'channel/client'
 
 export const security = await new Security().load()
+security.hubKey = await publicKey()
 
 const paddr = (a?: string) => (a ? (isNaN(Number(a)) ? a : Number(a)) : 1997)
 
@@ -56,9 +57,7 @@ export class Hub {
   header = new HubHeaderStore()
   hubNetNode = new HubNetNodeStore()
   ready: Promise<void>
-  apiList = new LazyStates<State, string[]>(state => {
-    return security.allowedApi(state.key, this.api)
-  })
+  apiList = new LazyStates<State, string[]>(state => this.allowedApi(security.caller(state.key)))
   serviceProviders = new LazyStates<string, ServiceProvider[]>((key: string) => {
     const index = key.indexOf('\u0000')
     if (index > 0) {
@@ -69,6 +68,7 @@ export class Hub {
   })
   constructor(address = paddr(Bun.env.HUBLISTEN)) {
     const services = this.services
+    const hub = this
     const statusState = new LazyState<StatusState>(() => ({
       requests,
       services: this.services.map(a => a.status),
@@ -84,6 +84,7 @@ export class Hub {
       }] : [])
     }).delay(1)
     const hubNetNode = new LazyState(() => this.hubNetNode.value)
+    const securityMode = new LazyState(() => ({ mode: security.effectiveMode, requireV1: security.requireV1 }))
     const sendUpdates = () => {
       statusState.setNeedsUpdate()
       statusBadges.setNeedsUpdate()
@@ -103,8 +104,21 @@ export class Hub {
       hubNetNode.setNeedsUpdate()
     })
 
+    // Built-in APIs by access class (protocol.md section 7); service paths are checked when forwarded
+    this.channel.use((ctx, next) => {
+      if (builtinAccess(ctx.path)) security.checkBuiltin(this.caller(ctx.state, ctx.sender, ctx.context), ctx.path)
+      return next()
+    })
+
     this.channel
-      .post('hub/api', ({ state }) => security.allowedApi(state.key, this.api))
+      .post('hub/info', () => ({ key: security.hubKey, protocol: 1, pro: true, mode: security.effectiveMode }))
+      .stream('hub/security/mode', () => securityMode.makeIterator())
+      .post('hub/security/mode/set', ({ body }) => {
+        security.setMode({ mode: body?.mode, requireV1: body?.requireV1 })
+        securityMode.setNeedsUpdate()
+        sendUpdates()
+      })
+      .post('hub/api', ({ state, sender, context }) => this.allowedApi(this.caller(state, sender, context)))
       .stream('hub/net/list', () => hubNetList.makeIterator())
       .stream('hub/net/node', () => hubNetNode.makeIterator())
       .post('hub/net/node/set', async ({ body, state, path }) => {
@@ -130,6 +144,7 @@ export class Hub {
           this.addServices(sender, state, Array.from(add), context)
           this.removeServices(sender, state, Array.from(remove), context)
           for (const service of s) {
+            this.services.get(service.path)?.setPublic(sender, service.public === true)
             const limit = service.limit ?? 0
             if (Number.isFinite(limit) && limit >= 0) {
               this.services.get(service.path)?.setLimit(sender, service.limit ?? 0)
@@ -310,10 +325,11 @@ export class Hub {
       .stream('hub/whitelist/status', () => security.whitelist.subscription.makeIterator())
       .stream('hub/status', () => statusState.makeIterator())
       .stream('hub/status/badges', () => statusBadges.makeIterator())
-      .postOther(other, async ({ body, path, context, task, state: { key } }) => {
+      .postOther(other, async ({ body, path, context, task, state, sender }) => {
         const service = this.services.get(path)
         if (!service) throw 'api not found'
-        if (!security.allowsCall(key, path)) throw 'permissions required'
+        const caller = this.caller(state, sender, context)
+        if (!security.allowsCall(caller, path, service.isPublic)) throw 'permissions required'
         const selected = typeof context?.service === 'string' ? service.select(context.service) : undefined
         let s = selected ?? service.next()
         if (!s) s = await service.addPending()
@@ -325,7 +341,7 @@ export class Hub {
         service.requests += 1
         requests += 1
         statusState.setNeedsUpdate()
-        const request = s.sender.request(path, body)
+        const request = s.sender.request(path, body, { context: forwardedContext(context, caller) })
         try {
           if (task) {
             s.sending.add(task)
@@ -342,10 +358,11 @@ export class Hub {
           statusState.setNeedsUpdate()
         }
       })
-      .streamOther(other, async function* ({ body, path, context, state: { key } }) {
+      .streamOther(other, async function* ({ body, path, context, state, sender }) {
         const service = services.get(path)
         if (!service) throw 'api not found'
-        if (!security.allowsCall(key, path)) throw 'permissions required'
+        const caller = hub.caller(state, sender, context)
+        if (!security.allowsCall(caller, path, service.isPublic)) throw 'permissions required'
         const selected = typeof context?.service === 'string' ? service.select(context.service) : undefined
         let s = selected ?? service.next()
         if (!s) s = await service.addPending()
@@ -355,7 +372,7 @@ export class Hub {
         s.streams += 1
         statusState.setNeedsUpdate()
         try {
-          for await (const value of s.sender.values(path, body)) {
+          for await (const value of s.sender.values(path, body, { context: forwardedContext(context, caller) })) {
             yield value
           }
         } finally {
@@ -378,7 +395,11 @@ export class Hub {
       })
     this.ready.then(() => this.channel.listen(address, {
         async state(headers: Record<string, string | undefined>): Promise<State> {
-          const key = security.keys.verify(headers['auth'] ?? undefined, security.whitelist)
+          const key = security.keys.verify(headers['auth'] ?? undefined, security.whitelist, {
+            version: headers['v'],
+            hubKey: security.hubKey,
+            requireV1: security.requireV1,
+          })
           return {
             id: randomUUIDv7(),
             key,
@@ -407,8 +428,31 @@ export class Hub {
   }
   servicesFor(path: string, key?: string): ServiceProvider[] {
     if (!path || !this.api.has(path)) return []
-    if (!security.allowsCall(key, path)) return []
-    return this.services.get(path)?.providers() ?? []
+    const service = this.services.get(path)
+    if (!security.allowsCall(key, path, service?.isPublic)) return []
+    return service?.providers() ?? []
+  }
+  /** Paths the caller may call, for `hub/api` */
+  allowedApi(caller: Caller): string[] {
+    return security.allowedApi(caller, this.api, path => this.services.get(path)?.isPublic ?? false)
+  }
+  /**
+   * Who sent a request. A request from a hub this one merges into is that hub's caller: its key as `hub/info`
+   * reported it (never an owner, since it isn't verified), `via` that key and the caller it claims.
+   */
+  caller(state: State, sender: Sender, context?: any): Caller {
+    const merge = this.merger.connectionFor(sender)
+    if (!merge) return security.caller(state.key)
+    const caller = security.caller(merge.hubKey)
+    const claimedHub = typeof context?.hub === 'object' ? context.hub : undefined
+    const via = merge.hubKey ?? (typeof claimedHub?.hubKey === 'string' ? claimedHub.hubKey : undefined)
+    return {
+      ...caller,
+      groups: caller.groups.filter(group => group !== ownersGroup),
+      owner: false,
+      ...(via ? { via } : {}),
+      ...(claimedHub?.caller !== undefined ? { claimed: claimedHub.caller } : {}),
+    }
   }
   addServices(sender: Sender, state: State, services: string[], context: ServiceUpdateContext) {
     services.forEach(s => {
@@ -460,6 +504,12 @@ export class Hub {
 
 const other = () => true
 
+/** The client's context with `hub` replaced by the caller (protocol.md section 4) */
+export function forwardedContext(context: any, caller: Caller): any {
+  const { hub: _, ...rest } = context && typeof context === 'object' ? context : {}
+  return { ...rest, hub: { caller, hubKey: security.hubKey } }
+}
+
 export interface Service {
   state: State
   sender: Sender
@@ -475,6 +525,8 @@ class Services {
   services: Service[] = []
   disabled: Service[] = []
   pending: ((service: Service | undefined) => void)[] = []
+  /** Connections whose header marked this path `public` */
+  publicSenders = new Set<Sender>()
   loadBalancer: LoadBalancer.Type
   isEnabled = false
   limited = false
@@ -547,7 +599,16 @@ class Services {
     this.disableServiceIfNeeded(context)
     return disabled.length
   }
+  setPublic(sender: Sender, isPublic: boolean) {
+    if (isPublic) this.publicSenders.add(sender)
+    else this.publicSenders.delete(sender)
+  }
+  /** Callable by anyone in `default-deny`: an enabled provider marked the path public */
+  get isPublic(): boolean {
+    return this.services.some(service => this.publicSenders.has(service.sender))
+  }
   remove(sender: Sender, context: ServiceUpdateContext) {
+    this.publicSenders.delete(sender)
     const s = this.loadBalancer.remove(this.services, sender)
     s?.sending.forEach(a => a.cancel())
     this.disableServiceIfNeeded(context)
@@ -695,6 +756,8 @@ interface ServiceHeader {
   path: string
   permissions?: ServicePermissions
   limit?: number
+  /** Callable by anyone in `default-deny` */
+  public?: boolean
 }
 interface ServicePermissions {
   group?: string

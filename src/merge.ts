@@ -2,7 +2,7 @@ import type { Hub } from './hub'
 import { sign } from './keychain'
 import { settings } from './settings'
 import { LazyState, LazyStates } from 'channel/more'
-const v = '0'
+import type { Sender } from 'channel/client'
 
 export class HubMerger {
   connections = new Map<string, Connection>()
@@ -49,6 +49,11 @@ export class HubMerger {
   context(): ServiceUpdateContext {
     return new ServiceUpdateContext(this)
   }
+  /** The merge or proxy connection a request arrived on, if it came from another hub */
+  connectionFor(sender: Sender): Connection | undefined {
+    for (const connection of this.connections.values()) if (connection.sender === sender) return connection
+    for (const connection of this.proxies.values()) if (connection.sender === sender) return connection
+  }
 }
 
 interface ConnectionStatus {
@@ -92,12 +97,16 @@ export class ServiceUpdateContext {
   }
 }
 
-class Connection {
+export class Connection {
   address: string
   channel?
   error?: string
+  /** The other hub's key from its `hub/info`, unverified. Once known, tokens are bound to it (v1). */
+  hubKey?: string
+  sender?: Sender
   constructor(address: string, hub: Hub, merge: boolean) {
     this.address = address
+    this.hubKey = settings.data.mergeKeys[address]
     if (merge) {
       console.log('Merging to', address)
     } else {
@@ -105,8 +114,11 @@ class Connection {
     }
     const t = this
     this.channel = hub.channel.connect(this.address, {
-      headers: async () => ({ auth: await sign(), v }),
+      headers: async () =>
+        t.hubKey ? { auth: await sign(10, t.hubKey), v: '1' } : { auth: await sign(), v: '0' },
       async onConnect(sender) {
+        t.sender = sender
+        if (!t.hubKey) await t.learnHubKey(sender)
         if (merge) {
           const add = Object.keys(hub.services.storage).filter(allows)
           if (!add.length) return
@@ -122,6 +134,15 @@ class Connection {
         }
       },
     })
+  }
+  /** Pins the other hub's key for the next connect. hub-lite has no `hub/info` and stays on v0. */
+  private async learnHubKey(sender: Sender) {
+    try {
+      const info = await sender.send('hub/info', undefined, { timeout: 10 })
+      if (typeof info?.key !== 'string' || !info.key) return
+      this.hubKey = info.key
+      settings.setMergeKey(this.address, info.key)
+    } catch {}
   }
   async update(add: string[], remove: string[]) {
     try {
