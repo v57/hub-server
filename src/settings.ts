@@ -1,5 +1,5 @@
 import type { Name as LoadBalancer } from './load balancers'
-import { mkdir, rename, unlink } from 'fs/promises'
+import { mkdir, rename, unlink, writeFile } from 'fs/promises'
 import { dirname } from 'path'
 try {
   await mkdir('data', { recursive: true })
@@ -173,11 +173,11 @@ export class Storage {
   }
 }
 
-export async function writeAtomically(path: string, text: string) {
+export async function writeAtomically(path: string, text: string, mode?: number) {
   await mkdir(dirname(path), { recursive: true })
   const temporaryPath = `${path}.${crypto.randomUUID()}.tmp`
   try {
-    await Bun.write(temporaryPath, text)
+    await writeFile(temporaryPath, text, mode === undefined ? undefined : { mode })
     await rename(temporaryPath, path)
   } catch (error) {
     await unlink(temporaryPath).catch(() => {})

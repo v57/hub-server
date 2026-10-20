@@ -348,7 +348,7 @@ export class NetworkAPI {
     hubKey: string
     hubNetworkId: string
     } {
-    if (!this.security.isOwner(state.key)) {
+    if (!this.security.isOwner(state)) {
       throw networkError('forbidden', `owner permission required for ${path}`, false)
     }
     return this.registerAuthenticatedProfile(profile, state)
@@ -381,7 +381,7 @@ export class NetworkAPI {
     state: State,
     path = 'hub/net/apple-agent/unbind',
   ): LocalAgentBindingStatus {
-    this.security.requireOwner(state.key, path)
+    this.security.requireOwner(state, path)
     if (request.version !== HUB_NETWORK_WIRE_VERSION) {
       throw networkError('unsupported_version', 'unsupported Apple app-agent version', false)
     }
@@ -405,7 +405,7 @@ export class NetworkAPI {
     path: string,
     renew: boolean,
   ): LocalAgentBindingStatus {
-    this.security.requireOwner(state.key, path)
+    this.security.requireOwner(state, path)
     const profile = this.authenticatedProfile(state)
     const { hubNetworkId } = this.registry.getIdentity()
     if (
@@ -507,7 +507,7 @@ export class NetworkAPI {
 
     // Check authorization
     const groupMembers = this.security.group.users.users(resource.policy.mode === 'group' ? resource.policy.group : '')
-    const isHubOwner = this.security.isOwner(state.key)
+    const isHubOwner = this.security.isOwner(state)
     const isAuthorized = this.permissions.isAuthorized(callerKey, resource, isHubOwner, groupMembers)
 
     if (!isAuthorized) {
@@ -672,9 +672,9 @@ export class NetworkAPI {
   listGatewayRevocations(state: State): GatewayRevocation[] {
     if (!state.key) return []
     const profile = this.agents.getProfile(state.key)
-    if (!profile && !this.security.isOwner(state.key)) return []
+    if (!profile && !this.security.isOwner(state)) return []
     return [...this.gatewayRevocations.values()].filter(revocation =>
-      this.security.isOwner(state.key)
+      this.security.isOwner(state)
       || revocation.gatewayKey === profile?.key
       || this.gatewayGrantAgents.get(revocation.gatewayKey)?.has(state.key!),
     )
@@ -746,7 +746,7 @@ export class NetworkAPI {
   }
 
   private canUseGatewayAPI(state: State): boolean {
-    return !!state.key && (this.security.isOwner(state.key) || !!this.agents.getProfile(state.key))
+    return !!state.key && (this.security.isOwner(state) || !!this.agents.getProfile(state.key))
   }
 
   private revokeGateway(key: string, reason: string): GatewayRevocation {
@@ -792,7 +792,7 @@ export class NetworkAPI {
     }
 
     // Only owner can change policy
-    if (resource.ownerKey !== state.key && !this.security.isOwner(state.key)) {
+    if (resource.ownerKey !== state.key && !this.security.isOwner(state)) {
       throw networkError('forbidden', 'only resource owner can change policy', false)
     }
 
@@ -822,7 +822,7 @@ export class NetworkAPI {
     }
 
     // Only owner can revoke
-    if (resource.ownerKey !== state.key && !this.security.isOwner(state.key)) {
+    if (resource.ownerKey !== state.key && !this.security.isOwner(state)) {
       throw networkError('forbidden', 'only resource owner can revoke', false)
     }
 
@@ -918,7 +918,7 @@ export class NetworkAPI {
   listAgents(state: State): AgentProfile[] {
     // The owner and the hub host's own agent see every member: the agent keeps
     // a WireGuard peer per member and enforces their port grants.
-    const isHubOwner = this.security.isOwner(state.key ?? '')
+    const isHubOwner = this.security.isOwner(state)
     const isLocalAgent = !!state.key && this.localAgent.binding('machine')?.key === state.key
     if (isHubOwner || isLocalAgent) {
       return this.listMembers()
@@ -965,7 +965,7 @@ export class NetworkAPI {
    * Get agent status for all agents.
    */
   getAgentStatus(state: State): import('./wire').AgentStatus[] {
-    const isHubOwner = this.security.isOwner(state.key ?? '')
+    const isHubOwner = this.security.isOwner(state)
     if (isHubOwner) {
       return this.agents.listAgentStatus()
     }
@@ -998,7 +998,7 @@ export class NetworkAPI {
 
   private canViewResource(resource: NetworkResource, state: State): boolean {
     if (!state.key) return false
-    if (resource.ownerKey === state.key || this.security.isOwner(state.key)) return true
+    if (resource.ownerKey === state.key || this.security.isOwner(state)) return true
 
     const key = this.agents.getProfile(state.key)?.key
     if (!key) return false

@@ -79,6 +79,7 @@ export class HubHeaderStore {
 }
 
 interface HubHeaderState {
+  device?: string
   key?: string
 }
 
@@ -99,7 +100,7 @@ export function registerHubHeaderAPIs<State extends HubHeaderState>(
   channel
     .stream('hub/header', () => state.makeIterator())
     .post('hub/header/set', async ({ body, state: connection }) => {
-      if (!security.isOwner(connection.key)) throw 'Permissions required'
+      if (!security.isOwner(connection)) throw 'Permissions required'
       const header = await store.update(body)
       state.send(header)
       return header

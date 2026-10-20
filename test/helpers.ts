@@ -43,3 +43,38 @@ export async function waitFor<T>(check: () => T | undefined | false | Promise<T 
 
 let nextPort = 20000 + Math.floor(Math.random() * 20000)
 export const freePort = () => nextPort++
+
+/** A `device` header signed by `device` for `service` */
+export function certificate(
+  device: TestKey,
+  service: TestKey,
+  fields: Record<string, unknown> = {},
+  now = Math.floor(Date.now() / 1000),
+): string {
+  const body = { v: 1, device: device.key, service: service.key, instance: 'test', iat: now, exp: now + 3600, ...fields }
+  const payload = Buffer.from(JSON.stringify(body)).toString('base64url')
+  return `${payload}.${sign(null, Buffer.from(payload), device.privateKey).toString('base64')}`
+}
+
+/** First value of a stream */
+export async function first<T = any>(client: Client, path: string, body?: any): Promise<T> {
+  for await (const value of client.sender.values(path, body)) return value
+  throw new Error('stream ended')
+}
+
+/** Reads a stream until a value passes `check`, returns that value */
+export async function until<T = any>(client: Client, path: string, check: (value: T) => boolean, body?: any, timeout = 3000): Promise<T> {
+  const iterator = client.sender.values(path, body)[Symbol.asyncIterator]()
+  const timer = Bun.sleep(timeout).then(() => {
+    throw new Error(`${path} never matched`)
+  })
+  try {
+    while (true) {
+      const { value, done } = await Promise.race([iterator.next(), timer])
+      if (done) throw new Error('stream ended')
+      if (check(value)) return value
+    }
+  } finally {
+    iterator.return?.()
+  }
+}

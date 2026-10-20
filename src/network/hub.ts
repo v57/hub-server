@@ -104,7 +104,7 @@ export function registerNetworkAPIs(
   const publishedState = new LazyStates<State, Wire.LiveProvider[]>(state =>
     networkAPI.agents.providers
       .map(provider => provider)
-      .filter(provider => provider.serviceKey === state.key || security.isOwner(state.key)),
+      .filter(provider => provider.serviceKey === state.key || security.isOwner(state)),
   )
   channel.stream('network/shares/published', ({ state }) => publishedState.makeIterator(state))
 
@@ -117,11 +117,11 @@ export function registerNetworkAPIs(
     () => networkAPI.localAgent.status(),
   ).dedupe('json')
   channel.stream('hub/net/local-agent', ({ state }) => {
-    if (!security.isOwner(state.key)) throw 'Permissions required'
+    if (!security.isOwner(state)) throw 'Permissions required'
     return localAgentState.makeIterator(state)
   })
   channel.post('hub/net/local-agent/rebind', async ({ body, state, path }) => {
-    security.requireOwner(state.key, path)
+    security.requireOwner(state, path)
     await networkAPI.localAgent.authorizeRebind(body.key)
     localAgentState.setNeedsUpdate()
     return { success: true }
@@ -254,7 +254,7 @@ export function registerNetworkAPIs(
     return { success: true }
   })
   channel.stream('hub/net/test/results', ({ state }) => {
-    if (!security.isOwner(state.key)) throw 'Permissions required'
+    if (!security.isOwner(state)) throw 'Permissions required'
     return (async function* () {
       for (const completion of hubNetTestResults.values()) {
         yield completion

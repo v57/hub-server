@@ -62,3 +62,21 @@ describe('NetworkRegistry', () => {
     expect(() => registry.allocateAddresses('key')).toThrow('corrupt')
   })
 })
+
+describe('DeviceRegistry', () => {
+  test('a corrupt devices.json moves aside and loads empty', async () => {
+    const { DeviceRegistry } = await import('../src/devices')
+    const dir = directory()
+    const path = join(dir, 'devices.json')
+    writeFileSync(path, '{"schema": 1, "revokedKeys": [')
+    const registry = await new DeviceRegistry(path).load()
+    expect(registry.storage.corrupt).toBe(true)
+    expect(registry.data.revokedKeys).toEqual([])
+  })
+  test('an unknown schema is treated as corrupt', async () => {
+    const { DeviceRegistry } = await import('../src/devices')
+    const path = join(directory(), 'devices.json')
+    writeFileSync(path, '{"schema": 2}')
+    expect((await new DeviceRegistry(path).load()).storage.corrupt).toBe(true)
+  })
+})

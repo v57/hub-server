@@ -1,13 +1,14 @@
 import { ObjectMap } from 'channel/channel'
 import { createPublicKey, verify } from 'crypto'
 import { Storage, settings, type SecurityMode } from './settings'
+import { deviceId } from './devices'
 import { LazyState } from 'channel/more'
 
 interface SecurityInterface {
-  requireOwner(user: string | undefined, path: string): void
+  requireOwner(user: Caller | Principal | string | undefined, path: string): void
   addOwner(user: string): void
-  allowsCall(caller: Caller | string | undefined, path: string, isPublic?: boolean): boolean
-  allowsHost(user: string | undefined, path: string): boolean
+  allowsCall(caller: Caller | Principal | string | undefined, path: string, isPublic?: boolean): boolean
+  allowsHost(user: Principal | string | undefined, path: string): boolean
 
   // Keys
   keys: {
@@ -140,14 +141,84 @@ export interface Caller {
 
 export const ownersGroup = 'owners'
 
+/** A connection's identity: its key and, when device-attached, its device id */
+export interface Principal {
+  key?: string
+  device?: string
+}
+type Who = Caller | Principal | string | undefined
+
+/** Group members are `key:<SPKI>` or `device:<id>` */
+export const keyMember = (key: string) => `key:${key}`
+export const deviceMember = (id: string) => `device:${id}`
+
+/**
+ * `data/group-members.json`: members of stored groups. Holds the built-in `owners` group, which `--owner` and
+ * `HUBOWNER` add to.
+ */
+class Members {
+  private groups = new Map<string, Set<string>>()
+  subscription = new LazyState<Record<string, string[]>>(() => this.encodeGroups())
+  storage = new Storage(
+    'data/group-members.json',
+    () => ({ schema: 1, groups: this.encodeGroups() }),
+    data => {
+      if (!data || typeof data !== 'object' || data.schema !== 1) throw new Error('unsupported group members file')
+      this.groups = new Map(Object.entries(data.groups ?? {}).map(([group, members]) => [group, new Set(members as string[])]))
+    },
+  )
+  private encodeGroups(): Record<string, string[]> {
+    return Object.fromEntries(Array.from(this.groups, ([group, members]) => [group, Array.from(members)]))
+  }
+  has(group: string, member: string): boolean {
+    return this.groups.get(group)?.has(member) ?? false
+  }
+  members(group: string): Set<string> {
+    return this.groups.get(group) ?? new Set()
+  }
+  /** Groups the principal is in, by key or by device */
+  groupsOf(principal: Principal): string[] {
+    const key = principal.key ? keyMember(principal.key) : undefined
+    const device = principal.device ? deviceMember(principal.device) : undefined
+    const result: string[] = []
+    for (const [group, members] of this.groups) {
+      if ((key && members.has(key)) || (device && members.has(device))) result.push(group)
+    }
+    return result
+  }
+  add(group: string, member: string) {
+    let members = this.groups.get(group)
+    if (!members) this.groups.set(group, (members = new Set()))
+    if (members.has(member)) return
+    members.add(member)
+    this.changed()
+  }
+  remove(group: string, member: string) {
+    if (!this.groups.get(group)?.delete(member)) return
+    this.changed()
+  }
+  /** Takes the member out of every group */
+  removeEverywhere(member: string) {
+    let changed = false
+    for (const members of this.groups.values()) changed = members.delete(member) || changed
+    if (changed) this.changed()
+  }
+  private changed() {
+    this.subscription.setNeedsUpdate()
+    this.storage.save()
+  }
+}
+
 export class Security implements SecurityInterface {
   keys = new Keys()
   host = new Host()
   call = new Call()
   group = new Group()
-  owners = new Set<string>()
+  members = new Members()
   launcher?: string
-  whitelist = new Whitelist(user => this.owners.has(user))
+  whitelist = new Whitelist(user => this.isOwner(user))
+  /** Device names for `caller.device`, set by the hub */
+  deviceName?: (id: string) => string | undefined
   /** This hub's own key, which v1 tokens are bound to */
   hubKey?: string
   mode: SecurityMode = 'default-allow'
@@ -163,15 +234,20 @@ export class Security implements SecurityInterface {
       this.group.names.storage.load(),
       this.group.users.storage.load(),
       this.whitelist.storage.load(),
+      this.members.storage.load(),
     ])
     this.mode = settings.data.security.mode
     this.requireV1 = settings.data.security.requireV1
     // An empty path list or whitelist opens the hub, so a corrupt one locks it down instead
-    if (settings.storage.corrupt || this.group.names.storage.corrupt || this.whitelist.storage.corrupt) {
-      this.lockdown = true
-      this.setMode({ mode: 'default-deny' }, false)
-    }
+    // An empty owners group keeps owners out, so a corrupt one also locks down until the startup owners return
+    const stores = [settings.storage, this.group.names.storage, this.whitelist.storage, this.members.storage]
+    if (stores.some(storage => storage.corrupt)) this.lockDown()
     return this
+  }
+  /** Only owners may call service paths, and the hub stays `default-deny` after a restart */
+  lockDown() {
+    this.lockdown = true
+    this.setMode({ mode: 'default-deny' }, false)
   }
   /** `default-deny` while locked down */
   get effectiveMode(): SecurityMode {
@@ -186,32 +262,43 @@ export class Security implements SecurityInterface {
     if (endsLockdown) this.lockdown = false
     settings.setSecurity({ mode: this.mode, requireV1: this.requireV1 })
   }
-  requireOwner(user: string | undefined, path: string): void {
-    if (!this.isOwner(user)) throw 'Permissions required'
+  requireOwner(who: Who, path: string): void {
+    if (!this.isOwner(who)) throw 'Permissions required'
   }
-  addOwner(user: string): void {
-    this.owners.add(user)
+  /** Adds a service or device SPKI to the stored `owners` group */
+  addOwner(key: string): void {
+    this.members.add(ownersGroup, keyMember(key))
+    this.members.add(ownersGroup, deviceMember(deviceId(key)))
   }
-  /** Caller of a connection, `undefined` key for anonymous ones */
-  caller(key: string | undefined): Caller {
-    const groups = this.groups(key)
-    return { ...(key ? { key } : {}), groups, owner: groups.includes(ownersGroup) }
+  /** Caller of a connection, no key for anonymous ones and a device only when device-attached */
+  caller(who: Principal | string | undefined): Caller {
+    const principal = typeof who === 'string' ? { key: who } : (who ?? {})
+    const groups = this.groups(principal)
+    const name = principal.device ? (this.deviceName?.(principal.device) ?? principal.device) : undefined
+    return {
+      ...(principal.key ? { key: principal.key } : {}),
+      ...(principal.device ? { device: { id: principal.device, name: name! } } : {}),
+      groups,
+      owner: groups.includes(ownersGroup),
+    }
   }
-  /** Every group the key belongs to, `owners` included */
-  groups(key: string | undefined): string[] {
-    if (!key) return []
-    const groups: string[] = []
-    const group = this.group.users.group(key)
-    if (group && group !== ownersGroup) groups.push(group)
-    if (this.owners.has(key)) groups.unshift(ownersGroup)
-    return groups
+  private asCaller(who: Who): Caller {
+    if (who && typeof who === 'object' && Array.isArray((who as Caller).groups)) return who as Caller
+    return this.caller(who as Principal | string | undefined)
+  }
+  /** Every group the key or its device belongs to, `owners` first */
+  groups(principal: Principal): string[] {
+    const groups = this.members.groupsOf(principal)
+    const group = principal.key ? this.group.users.group(principal.key) : undefined
+    if (group && !groups.includes(group)) groups.push(group)
+    return groups.sort((a, b) => (a === ownersGroup ? -1 : b === ownersGroup ? 1 : 0))
   }
   /**
    * A call to a service path. Owners always; then grants (per-key call lists and group path lists); then in
    * `default-deny` only paths the providing service marked public, in `default-allow` every path no group restricts.
    */
-  allowsCall(caller: Caller | string | undefined, path: string, isPublic = false): boolean {
-    const c = typeof caller === 'object' ? caller : this.caller(caller)
+  allowsCall(caller: Who, path: string, isPublic = false): boolean {
+    const c = this.asCaller(caller)
     if (c.owner) return true
     if (this.lockdown) return false
     if (this.granted(c, path)) return true
@@ -251,18 +338,20 @@ export class Security implements SecurityInterface {
       return false
     }
   }
-  allowsHost(user: string | undefined, path: string): boolean {
+  allowsHost(who: Principal | string | undefined, path: string): boolean {
+    const principal = typeof who === 'string' ? { key: who } : (who ?? {})
+    const user = principal.key
     if (!user) return false
     if (path.startsWith('hub/')) return false
     if (this.launcher && path.startsWith('launcher/') && user === this.launcher) return true
-    if (this.owners.has(user)) return true
+    if (this.isOwner(principal)) return true
     if (this.host.allows(user, path)) return true
     this.host.ask(user, path)
     return false
   }
   /** The paths of `api` this caller may call, for `hub/api` */
-  allowedApi(caller: Caller | string | undefined, api: Set<string>, isPublic: (path: string) => boolean = () => false): string[] {
-    const c = typeof caller === 'object' ? caller : this.caller(caller)
+  allowedApi(caller: Who, api: Set<string>, isPublic: (path: string) => boolean = () => false): string[] {
+    const c = this.asCaller(caller)
     return Array.from(api).filter(path =>
       builtinAccess(path) ? this.allowsBuiltin(c, path) : this.allowsCall(c, path, isPublic(path)),
     )
@@ -271,9 +360,25 @@ export class Security implements SecurityInterface {
     if (!user) return
     return this.group.users.group(user)
   }
-  isOwner(user: string | undefined): boolean {
-    if (!user) return false
-    return this.owners.has(user)
+  /** Drops what a revoked key was granted: call and host lists and its group */
+  revokeKey(key: string) {
+    this.call.revoke(key, Array.from(this.call.allowed(key)))
+    this.call.pendingList.deleteAll(key)
+    this.host.revoke(key, Array.from(this.host.allowed(key)))
+    this.host.pendingList.deleteAll(key)
+    const group = this.group.users.group(key)
+    if (group) this.group.users.remove(key, group)
+  }
+  /** A member of `owners` by key, or by the device the connection is attached to */
+  isOwner(who: Who): boolean {
+    if (!who) return false
+    if (typeof who === 'string') return this.members.has(ownersGroup, keyMember(who))
+    if (Array.isArray((who as Caller).groups)) return (who as Caller).owner
+    const principal = who as Principal
+    return (
+      (!!principal.key && this.members.has(ownersGroup, keyMember(principal.key))) ||
+      (!!principal.device && this.members.has(ownersGroup, deviceMember(principal.device)))
+    )
   }
   registerProtectedApis(apis: Record<string, string>): void {
     for (const [path, name] of Object.entries(apis)) {
