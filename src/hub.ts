@@ -159,7 +159,8 @@ export class Hub {
       .stream('hub/api/services', ({ body, state: { key, device } }) => {
         return this.serviceProviders.makeIterator(JSON.stringify([key, device, body]))
       })
-      .post('hub/service/update', ({ body: { add, remove, addApps, removeApps, services, apps }, state, sender }) => {
+      .post('hub/service/update', ({ body: { add, remove, addApps, removeApps, services, apps, reporter }, state, sender }) => {
+        if (reporter === true) this.devices.requestReporter(state)
         const context = this.merger.context()
         if (services && Array.isArray(services)) {
           const s = services as ServiceHeader[]
@@ -356,7 +357,7 @@ export class Hub {
         if (!service) throw 'api not found'
         const caller = this.caller(state, sender, context)
         if (!security.allowsCall(caller, path, service.isPublic)) throw 'permissions required'
-        const selected = typeof context?.service === 'string' ? service.select(context.service) : undefined
+        const selected = service.selectFor(context)
         let s = selected ?? service.next()
         if (!s) s = await service.addPending()
         if (!s) throw 'api not found'
@@ -389,7 +390,7 @@ export class Hub {
         if (!service) throw 'api not found'
         const caller = hub.caller(state, sender, context)
         if (!security.allowsCall(caller, path, service.isPublic)) throw 'permissions required'
-        const selected = typeof context?.service === 'string' ? service.select(context.service) : undefined
+        const selected = service.selectFor(context)
         let s = selected ?? service.next()
         if (!s) s = await service.addPending()
         if (!s) throw 'api not found'
@@ -418,6 +419,7 @@ export class Hub {
         if (sendUpdates) statusBadges.setNeedsUpdate()
         // Cleanup network agent profile and providers
         this.networkAPI?.handleDisconnect(state)
+        this.devices.disconnected(state)
         if (state.device) this.devices.devicesState.setNeedsUpdate()
       })
     this.ready.then(() => this.channel.listen(address, {
@@ -598,8 +600,22 @@ class Services {
       return
     }
   }
-  select(id: string): Service | undefined {
-    return this.services.find(service => service.state.key === id || service.state.id === id)
+  select(id: string, device?: string): Service | undefined {
+    return this.services.find(
+      service => (service.state.key === id || service.state.id === id) && (!device || service.state.device === device),
+    )
+  }
+  /**
+   * The provider `context.service` (connection id or key) or `context.device` (device id) asks for. A device with
+   * no provider of the path fails with `api not found`; an unknown service falls back to load balancing as before.
+   */
+  selectFor(context: any): Service | undefined {
+    const device = typeof context?.device === 'string' ? context.device : undefined
+    const selected = typeof context?.service === 'string' ? this.select(context.service, device) : undefined
+    if (selected || !device) return selected
+    const onDevice = this.services.filter(service => service.state.device === device)
+    if (!onDevice.length) throw 'api not found'
+    return onDevice.reduce((a, b) => (b.sending.size + b.streams < a.sending.size + a.streams ? b : a))
   }
   allowKey(key: string, context: ServiceUpdateContext): number {
     let enabled = new Set<Service>()

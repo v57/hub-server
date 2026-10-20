@@ -1,5 +1,6 @@
 import type { BodyContext, Channel } from 'channel/server'
-import { LazyState } from 'channel/more'
+import { LazyState, LazyStates } from 'channel/more'
+import { createPublicKey, verify } from 'node:crypto'
 import type { Hub, State } from './hub'
 import {
   DeviceRegistry,
@@ -52,6 +53,11 @@ export class HubDevices {
   onRemoved?: (removal: DeviceRemoval) => void
   /** Network presence of a device, from Hub Network */
   networkState?: (id: string) => 'online' | 'offline' | undefined
+  /** Connections that asked for the reporter role, oldest first; the first attached one of a device reports */
+  private reporterCandidates: State[] = []
+  /** Latest live data per device, in memory only */
+  private liveData = new Map<string, Record<string, unknown>>()
+  liveDataState = new LazyStates<string, Record<string, unknown>>(id => this.liveData.get(id) ?? {})
 
   constructor(
     private hub: Hub,
@@ -156,6 +162,7 @@ export class HubDevices {
 
   /** Closes the device's connections and those of revoked keys, and drops their grants and group memberships */
   private cleanUp(id: string, revokedKeys: string[]) {
+    this.liveData.delete(id)
     const revoked = new Set(revokedKeys)
     for (const connection of this.hub.connections) {
       const { state } = connection
@@ -212,7 +219,76 @@ export class HubDevices {
     }
   }
 
+  /** `hub/service/update` with `reporter: true` */
+  requestReporter(state: State) {
+    if (!this.reporterCandidates.includes(state)) this.reporterCandidates.push(state)
+  }
+  disconnected(state: State) {
+    const index = this.reporterCandidates.indexOf(state)
+    if (index >= 0) this.reporterCandidates.splice(index, 1)
+  }
+  /** The connection that reports for a device: the first connected candidate attached to it */
+  reporter(id: string): State | undefined {
+    return this.reporterCandidates.find(state => state.device === id)
+  }
+  private requireReporter(state: State): string {
+    const id = state.device
+    if (!id || this.reporter(id) !== state) throw 'not the device reporter'
+    return id
+  }
+
+  /** `hub/device/describe` from the reporter: its name suggestion, OS, architecture and capabilities */
+  describeSelf(state: State, body: unknown) {
+    const id = this.requireReporter(state)
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw 'invalid description'
+    const { name, os, arch, capabilities } = body as Record<string, unknown>
+    const text = (value: unknown, max: number) =>
+      value === undefined || (typeof value === 'string' && Buffer.byteLength(value) <= max)
+    if (!text(name, 64) || !text(os, 64) || !text(arch, 32)) throw 'invalid description'
+    if (capabilities !== undefined) {
+      if (!capabilities || typeof capabilities !== 'object' || Array.isArray(capabilities)) throw 'invalid capabilities'
+      if (JSON.stringify(capabilities).length > 65536) throw 'capabilities too large'
+      this.checkSSH(id, (capabilities as Record<string, any>).ssh)
+    }
+    this.registry.update(id, {
+      name: name as string | undefined,
+      os: os as string | undefined,
+      arch: arch as string | undefined,
+      capabilities: capabilities as Record<string, unknown> | undefined,
+    })
+  }
+
+  /** `ssh.hostKeySignature` must be the device's signature over `ssh1:<hostKey>` */
+  private checkSSH(id: string, ssh: any) {
+    if (ssh === undefined) return
+    const device = this.registry.device(id)!
+    if (!ssh || typeof ssh.hostKey !== 'string' || typeof ssh.hostKeySignature !== 'string' || !Number.isInteger(ssh.port)) {
+      throw 'invalid ssh capability'
+    }
+    const key = createPublicKey({ key: Buffer.from(device.key, 'base64'), format: 'der', type: 'spki' })
+    if (!verify(null, Buffer.from(`ssh1:${ssh.hostKey}`), key, Buffer.from(ssh.hostKeySignature, 'base64'))) {
+      throw 'invalid ssh host key signature'
+    }
+  }
+
+  /** `hub/device/data` from the reporter: live CPU, memory, battery and so on, kept in memory */
+  reportData(state: State, body: unknown) {
+    const id = this.requireReporter(state)
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw 'invalid data'
+    if (JSON.stringify(body).length > 16384) throw 'data too large'
+    this.liveData.set(id, body as Record<string, unknown>)
+    this.liveDataState.setNeedsUpdate(id)
+  }
+
   register(channel: Channel<State>) {
+    channel
+      .post('hub/device/describe', ({ body, state }) => this.describeSelf(state, body))
+      .post('hub/device/data', ({ body, state }) => this.reportData(state, body))
+      .stream('hub/devices/data', ({ body }) => {
+        const id = body?.id
+        if (typeof id !== 'string' || !this.registry.device(id)) throw 'device not found'
+        return this.liveDataState.makeIterator(id)
+      })
     channel
       .stream('hub/devices', () => this.devicesState.makeIterator())
       .stream('hub/devices/pending', () => this.pendingState.makeIterator())
