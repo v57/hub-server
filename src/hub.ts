@@ -1,6 +1,6 @@
 import { Channel, type Sender, type BodyContext, ObjectMap } from 'channel/server'
 import 'channel/client'
-import { LazyState, LazyStates } from 'channel/more'
+import { LazyStates } from 'channel/more'
 import { HubMerger, ServiceUpdateContext } from './merge.ts'
 import { settings } from './settings.ts'
 import { publicKey } from './keychain.ts'
@@ -18,6 +18,7 @@ import { NetworkAPI } from './network/api'
 import { HubHeaderStore, registerHubHeaderAPIs } from './header'
 import { HubNetNodeStore } from './network/node-store'
 import { HubDevices } from './hub-devices'
+import { FreshState } from './fresh-state'
 import type { Certificate } from './devices'
 
 export type { Sender } from 'channel/client'
@@ -82,22 +83,22 @@ export class Hub {
   constructor(address = paddr(Bun.env.HUBLISTEN)) {
     const services = this.services
     const hub = this
-    const statusState = new LazyState<StatusState>(() => ({
+    const statusState = new FreshState<StatusState>(() => ({
       requests,
       services: this.services.map(a => a.status),
       pro: true,
     }))
-    const connectionsState = new LazyState(() => this.connectionsInfo()).delay(1)
-    const statusBadges = new LazyState<StatusBadges>(() => this.statusBadges)
-    const hubNetList = new LazyState<HubNetInfo[]>(() => {
+    const connectionsState = new FreshState(() => this.connectionsInfo()).delay(1)
+    const statusBadges = new FreshState<StatusBadges>(() => this.statusBadges)
+    const hubNetList = new FreshState<HubNetInfo[]>(() => {
       const providers = this.services.get('net/invite')?.services ?? []
       return providers.flatMap(provider => provider.state.key ? [{
         id: provider.state.key,
         localIp: provider.state.ip === '::1' ? '127.0.0.1' : (provider.state.ip ?? ''),
       }] : [])
     }).delay(1)
-    const hubNetNode = new LazyState(() => this.hubNetNode.value)
-    const securityMode = new LazyState(() => ({ mode: security.effectiveMode, requireV1: security.requireV1 }))
+    const hubNetNode = new FreshState(() => this.hubNetNode.value)
+    const securityMode = new FreshState(() => ({ mode: security.effectiveMode, requireV1: security.requireV1 }))
     const sendUpdates = () => {
       statusState.setNeedsUpdate()
       statusBadges.setNeedsUpdate()

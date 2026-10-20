@@ -1,5 +1,5 @@
 import { randomUUIDv7 } from 'bun'
-import { LazyState } from 'channel/more'
+import { FreshState } from './fresh-state'
 import { Storage } from './settings'
 
 // Grants, protocol.md sections 6, 7 and 9
@@ -55,7 +55,7 @@ export class GrantStore {
   grants: Grant[] = []
   /** Old stores already turned into grants */
   migrated: string[] = []
-  subscription = new LazyState<Grant[]>(() => this.grants)
+  subscription = new FreshState<Grant[]>(() => this.grants)
   /** Grants added or removed, for Hub Network to revoke share connections */
   onChange?: (changed: Grant[]) => void
   storage = new Storage(

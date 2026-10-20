@@ -1,17 +1,17 @@
 import type { Hub } from './hub'
 import { sign } from './keychain'
 import { settings } from './settings'
-import { LazyState, LazyStates } from 'channel/more'
+import { FreshState } from './fresh-state'
 import type { Sender } from 'channel/client'
 
 export class HubMerger {
   connections = new Map<string, Connection>()
   proxies = new Map<string, Connection>()
-  state: LazyState<ConnectionStatus[]>
+  state: FreshState<ConnectionStatus[]>
   hub: Hub
   constructor(hub: Hub) {
     this.hub = hub
-    this.state = new LazyState<ConnectionStatus[]>(async () =>
+    this.state = new FreshState<ConnectionStatus[]>(async () =>
       this.connections
         .values()
         .map(a => a.status)

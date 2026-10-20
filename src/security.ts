@@ -2,7 +2,7 @@ import { ObjectMap } from 'channel/channel'
 import { createPublicKey, verify } from 'crypto'
 import { Storage, settings, type SecurityMode } from './settings'
 import { deviceId } from './devices'
-import { LazyState } from 'channel/more'
+import { FreshState } from './fresh-state'
 import { GrantStore, parseObject, parseSubject, type Grant } from './grants'
 
 interface SecurityInterface {
@@ -158,7 +158,7 @@ export const deviceMember = (id: string) => `device:${id}`
 class Members {
   private groups = new Map<string, Set<string>>()
   /** `hub/group/users`: group → members, keys as plain SPKIs as before */
-  subscription = new LazyState<Record<string, string[]>>(() =>
+  subscription = new FreshState<Record<string, string[]>>(() =>
     Object.fromEntries(
       Array.from(this.groups, ([group, members]) => [
         group,
@@ -493,7 +493,7 @@ class Keys {
 class Host {
   allowedList = new MapSet<string>()
   pendingList = new MapSet<string>()
-  pendingSubscription = new LazyState(() => this.pendingList.encode())
+  pendingSubscription = new FreshState(() => this.pendingList.encode())
   storage = new Storage(
     'data/services.json',
     () => ({
@@ -545,7 +545,7 @@ class Host {
  */
 class Call {
   pendingList = new MapSet<string>()
-  pendingSubscription = new LazyState(() => this.pendingList.encode())
+  pendingSubscription = new FreshState(() => this.pendingList.encode())
   /** The old per-key lists, only read for migration */
   legacy = new MapSet<string>()
   storage = new Storage(
@@ -621,11 +621,11 @@ class Group {
     },
   )
   /** `hub/group/list`: group → granted paths, as before */
-  subscription = new LazyState<any>(() =>
+  subscription = new FreshState<any>(() =>
     Object.fromEntries(Array.from(this.groups.keys(), group => [group, Array.from(this.allowed(group))])),
   )
   /** `hub/groups`: every group with its kind, members and paths */
-  infoSubscription = new LazyState<GroupInfo[]>(() => this.list())
+  infoSubscription = new FreshState<GroupInfo[]>(() => this.list())
   constructor(
     private grants: GrantStore,
     private members: Members,
@@ -767,7 +767,7 @@ class GroupNames {
       })
     },
   )
-  subscription = new LazyState<any>(() => this.names.storage)
+  subscription = new FreshState<any>(() => this.names.storage)
   constructor() {
     this.setHubApi()
   }
@@ -828,7 +828,7 @@ class Whitelist {
       this.users = new Set(data.whitelist)
     },
   )
-  subscription = new LazyState<{ enabled: boolean; users: string[] }>(() => ({
+  subscription = new FreshState<{ enabled: boolean; users: string[] }>(() => ({
     enabled: this.enabled,
     users: Array.from(this.users),
   }))

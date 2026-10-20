@@ -1,5 +1,6 @@
 import type { BodyContext, Channel } from 'channel/server'
-import { LazyState, LazyStates } from 'channel/more'
+import { LazyStates } from 'channel/more'
+import { FreshState } from './fresh-state'
 import { createPublicKey, verify } from 'node:crypto'
 import type { Hub, State } from './hub'
 import {
@@ -48,8 +49,8 @@ export class HubDevices {
   registry = new DeviceRegistry()
   /** The device this hub runs on */
   selfId?: string
-  devicesState = new LazyState<Device[]>(() => this.list()).delay(0.1)
-  pendingState = new LazyState<PendingDevice[]>(() => this.registry.pending())
+  devicesState = new FreshState<Device[]>(() => this.list()).delay(0.1)
+  pendingState = new FreshState<PendingDevice[]>(() => this.registry.pending())
   /** Hub Network removes the member of a removed or revoked device */
   onRemoved?: (removal: DeviceRemoval) => void
   /** Network presence of a device, from Hub Network */
