@@ -54,8 +54,10 @@ describe('Hub Network on the hub', () => {
     await bind(lost, 'wg-lost')
     await bind(other, 'wg-other')
     expect(hub.networkAPI!.registry.hasAllocation(`device:${lostId}`)).toBe(true)
-    const device = await until<any[]>(owners, 'hub/devices', list => list.some(d => d.id === lostId && d.network === 'online'))
-    expect(device.find(d => d.id === lostId).network).toBe('online')
+    const devices = await until<any[]>(owners, 'hub/devices', list => list.some(d => d.id === lostId && d.network === 'online'))
+    const listed = devices.find(d => d.id === lostId)
+    expect(listed.overlay.address).toMatch(/^100\./)
+    expect(listed.overlay.authority).toMatch(/^agent-box-[a-z2-7]{16}\.v1-[a-z2-7]{16}\.hub\.invalid$/)
 
     await owners.sender.send('hub/device/revoke', { id: lostId })
     const revoked = await until<any[]>(other, 'network/devices/revoked', list => list.length > 0)

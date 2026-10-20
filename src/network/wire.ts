@@ -48,10 +48,12 @@ export interface AgentProfile extends Versioned {
   connectedAt: Timestamp
   /** Set in member lists: false for a known member that is not connected. */
   online?: boolean
-  /** Device id when the member is a device */
+  /** Member key: `device:<id>` for device-attached agents, else the service key */
+  member?: string
+  /** Device id when device-attached */
   device?: string
   /** `<label>-<16>.v1-<hub>.hub.invalid`, resolving to the device's overlay address */
-  deviceName?: string
+  deviceAuthority?: string
 }
 
 /** `network/devices/revoked`: peers agents must drop and refuse */

@@ -27,6 +27,7 @@ export interface Device {
   revoked: boolean
   online: boolean
   network?: 'online' | 'offline'
+  overlay?: { address: string; authority: string }
   lastSeen: string
   capabilities?: Record<string, unknown>
   services: { key: string; instance: string; name?: string; online: boolean; paths: string[] }[]
@@ -53,6 +54,8 @@ export class HubDevices {
   onRemoved?: (removal: DeviceRemoval) => void
   /** Network presence of a device, from Hub Network */
   networkState?: (id: string) => 'online' | 'offline' | undefined
+  /** Overlay address and DNS name of a device member, from Hub Network */
+  overlay?: (id: string) => { address: string; authority: string } | undefined
   /** Connections that asked for the reporter role, oldest first; the first attached one of a device reports */
   private reporterCandidates: State[] = []
   /** Latest live data per device, in memory only */
@@ -198,6 +201,7 @@ export class HubDevices {
         return { key, instance: service.instance, name: service.name, online: states.length > 0, paths: Array.from(paths) }
       })
     const network = this.networkState?.(id)
+    const overlay = this.overlay?.(id)
     return {
       id,
       key: device.key,
@@ -210,6 +214,7 @@ export class HubDevices {
       revoked: !!device.revoked,
       online: attached.length > 0 || id === this.selfId,
       ...(network ? { network } : {}),
+      ...(overlay ? { overlay } : {}),
       lastSeen: id === this.selfId ? new Date().toISOString() : device.lastSeen,
       capabilities: device.capabilities,
       services,
@@ -255,16 +260,19 @@ export class HubDevices {
     })
   }
 
-  /** `ssh.hostKeySignature` must be the device's signature over `ssh1:<hostKey>` */
+  /** `ssh.hostKey` and every `ssh.hostKeys` entry must carry the device's signature over `ssh1:<hostKey>` */
   private checkSSH(id: string, ssh: any) {
     if (ssh === undefined) return
     const device = this.registry.device(id)!
-    if (!ssh || typeof ssh.hostKey !== 'string' || typeof ssh.hostKeySignature !== 'string' || !Number.isInteger(ssh.port)) {
+    if (!ssh || !Number.isInteger(ssh.port) || (ssh.hostKeys !== undefined && !Array.isArray(ssh.hostKeys))) {
       throw 'invalid ssh capability'
     }
     const key = createPublicKey({ key: Buffer.from(device.key, 'base64'), format: 'der', type: 'spki' })
-    if (!verify(null, Buffer.from(`ssh1:${ssh.hostKey}`), key, Buffer.from(ssh.hostKeySignature, 'base64'))) {
-      throw 'invalid ssh host key signature'
+    for (const entry of [ssh, ...(ssh.hostKeys ?? [])]) {
+      if (typeof entry?.hostKey !== 'string' || typeof entry.hostKeySignature !== 'string') throw 'invalid ssh capability'
+      if (!verify(null, Buffer.from(`ssh1:${entry.hostKey}`), key, Buffer.from(entry.hostKeySignature, 'base64'))) {
+        throw 'invalid ssh host key signature'
+      }
     }
   }
 

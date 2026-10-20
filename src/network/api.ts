@@ -470,11 +470,9 @@ export class NetworkAPI {
     // One agent per device. Its proof passed, so a pending device is approved and the member is the device.
     const deviceId = state.certificate?.deviceId
     if (deviceId) {
-      const stored = this.registry.data.members[deviceMemberKey(deviceId)]
+      // Another key takes over only while the old agent is offline (a reinstall), keeping the addresses
       const connected = [...this.agentDevices].some(([key, device]) => device === deviceId && key !== state.key)
-      if (connected || (stored && (stored.key ?? '') !== state.key)) {
-        throw networkError('device_endpoint_exists', 'this device already has a network endpoint', false)
-      }
+      if (connected) throw networkError('device_endpoint_exists', 'this device already has a network endpoint', false)
       if (!state.device) this.onBindApprove?.(state)
     }
     const memberKey = state.device ? deviceMemberKey(state.device) : state.key
@@ -490,6 +488,8 @@ export class NetworkAPI {
       name: typeof profile.name === 'string' ? profile.name : undefined,
       platform: typeof profile.platform === 'string' ? profile.platform : undefined,
       key: state.key,
+      member: memberKey,
+      ...(state.device ? { device: state.device } : {}),
       overlayAddresses: [addresses.ipv4, addresses.ipv6],
       connectedAt: new Date().toISOString(),
     }
@@ -942,6 +942,8 @@ export class NetworkAPI {
       .map(({ key, member, addresses }): AgentProfile => ({
         version: HUB_NETWORK_WIRE_VERSION,
         key: member.key ?? key,
+        member: key,
+        ...(member.device ? { device: member.device } : {}),
         wireGuardKey: member.wireGuardKey,
         name: member.name,
         platform: member.platform,
@@ -958,11 +960,22 @@ export class NetworkAPI {
     return [...online, ...offline]
   }
 
-  private deviceFields(device: string | undefined, name: string | undefined): Pick<AgentProfile, 'device' | 'deviceName'> {
+  private deviceFields(device: string | undefined, name: string | undefined): Pick<AgentProfile, 'deviceAuthority'> {
     if (!device) return {}
+    return { deviceAuthority: this.deviceAuthority(device, name) }
+  }
+
+  /** The device's DNS name, from its registry name */
+  deviceAuthority(device: string, fallbackName?: string): string {
     const { hubNetworkId } = this.registry.getIdentity()
-    const label = this.deviceLabel?.(device) ?? name ?? 'device'
-    return { device, deviceName: deviceAuthority(hubNetworkId, device, label) }
+    return deviceAuthority(hubNetworkId, device, this.deviceLabel?.(device) ?? fallbackName ?? 'device')
+  }
+
+  /** `Device.overlay`: the device member's IPv4 overlay address and DNS name */
+  deviceOverlay(device: string): { address: string; authority: string } | undefined {
+    const addresses = this.registry.data.allocations[deviceMemberKey(device)]
+    if (!addresses) return
+    return { address: addresses[0], authority: this.deviceAuthority(device, this.registry.data.members[deviceMemberKey(device)]?.name) }
   }
 
   /** Device names for member DNS names, set by the hub */

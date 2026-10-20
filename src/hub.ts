@@ -124,6 +124,7 @@ export class Hub {
     }
     networkAPI.deviceLabel = id => this.devices.registry.device(id)?.name
     this.devices.networkState = id => networkAPI.deviceNetworkState(id)
+    this.devices.overlay = id => networkAPI.deviceOverlay(id)
     this.devices.onRemoved = ({ id, revokedKeys }) => networkAPI.removeDevice(id, revokedKeys)
     // Grants and group membership decide calls, `hub/api` lists and share connections
     security.grants.onChange = changed => {

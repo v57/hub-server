@@ -58,37 +58,52 @@ describe('Hub Network members by device', () => {
     expect(api.registry.hasAllocation(`device:${deviceA}`)).toBe(true)
     expect(api.registry.hasAllocation(agent.key)).toBe(false)
     expect(api.registry.data.members[`device:${deviceA}`]).toMatchObject({ key: agent.key, device: deviceA, wireGuardKey: 'wg-a' })
+    expect(result.profile).toMatchObject({ key: agent.key, member: `device:${deviceA}`, device: deviceA })
     const member = api.listMembers().find(profile => profile.key === agent.key)!
-    expect(member).toMatchObject({ device: deviceA, online: true })
-    expect(member.deviceName).toBe(deviceAuthority(api.registry.getIdentity().hubNetworkId, deviceA, 'Mac Studio'))
-    expect(member.deviceName).toMatch(/^mac-studio-[a-z2-7]{16}\.v1-[a-z2-7]{16}\.hub\.invalid$/)
+    expect(member).toMatchObject({ member: `device:${deviceA}`, device: deviceA, online: true })
+    const authority = deviceAuthority(api.registry.getIdentity().hubNetworkId, deviceA, 'Mac Studio')
+    expect(member.deviceAuthority).toBe(authority)
+    expect(member.deviceAuthority).toMatch(/^mac-studio-[a-z2-7]{16}\.v1-[a-z2-7]{16}\.hub\.invalid$/)
     expect(api.deviceNetworkState(deviceA)).toBe('online')
+    expect(api.deviceOverlay(deviceA)).toEqual({ address: result.profile.overlayAddresses[0], authority })
+    // Offline members keep their member key and device
+    api.agents.unregisterProfile(agent.key)
+    expect(api.listMembers()[0]).toMatchObject({ key: agent.key, member: `device:${deviceA}`, device: deviceA, online: false })
   })
 
   test('a legacy agent keeps its key as member and its addresses when its device appears', async () => {
     const agent = owner()
     const legacy = await api.bindAgent(bind('wg-a'), {} as never, state(agent))
     expect(api.registry.hasAllocation(agent.key)).toBe(true)
+    expect(legacy.profile.member).toBe(agent.key)
+    expect(legacy.profile.device).toBeUndefined()
     const attached = await api.bindAgent(bind('wg-a'), {} as never, state(agent, deviceA))
     expect(attached.profile.overlayAddresses).toEqual(legacy.profile.overlayAddresses)
     expect(api.registry.hasAllocation(agent.key)).toBe(false)
     expect(api.registry.hasAllocation(`device:${deviceA}`)).toBe(true)
   })
 
-  test('a second agent key on a device is refused, the same key binds again', async () => {
+  test('a second agent key on a device is refused while the first is online, and takes over once it is offline', async () => {
     const first = owner()
     const second = owner()
-    await api.bindAgent(bind('wg-a'), {} as never, state(first, deviceA))
-    await expect(api.bindAgent(bind('wg-b'), {} as never, state(second, deviceA))).rejects.toMatchObject({
-      code: 'device_endpoint_exists',
-    })
-    // Still refused while the first agent is offline
-    api.agents.unregisterProfile(first.key)
-    await expect(api.bindAgent(bind('wg-b'), {} as never, state(second, deviceA))).rejects.toMatchObject({
-      code: 'device_endpoint_exists',
-    })
-    const again = await api.bindAgent(bind('wg-a'), {} as never, state(first, deviceA))
+    const firstState = state(first, deviceA)
+    const bound = await api.bindAgent(bind('wg-a'), {} as never, firstState)
+    const againState = state(first, deviceA)
+    const again = await api.bindAgent(bind('wg-a'), {} as never, againState)
     expect(again.profile.key).toBe(first.key)
+    await expect(api.bindAgent(bind('wg-b'), {} as never, state(second, deviceA))).rejects.toMatchObject({
+      code: 'device_endpoint_exists',
+    })
+    // A reinstall: the old agent is gone, the new key keeps the addresses with its own WireGuard key
+    api.handleDisconnect(firstState)
+    api.handleDisconnect(againState)
+    const replaced = await api.bindAgent(bind('wg-b'), {} as never, state(second, deviceA))
+    expect(replaced.profile.overlayAddresses).toEqual(bound.profile.overlayAddresses)
+    expect(api.registry.data.members[`device:${deviceA}`]).toMatchObject({ key: second.key, wireGuardKey: 'wg-b' })
+    // Now the first key is the one refused
+    await expect(api.bindAgent(bind('wg-a'), {} as never, state(first, deviceA))).rejects.toMatchObject({
+      code: 'device_endpoint_exists',
+    })
   })
 
   test('a bind with a pending certificate approves the device first', async () => {

@@ -65,7 +65,13 @@ describe('device reporter, data and selection', () => {
     const current = Array.from(hub.connections).find(c => c.state === reporter)!
     const bad = { ssh: { port: 22, hostKey, hostKeySignature: Buffer.alloc(64).toString('base64') } }
     expect(() => hub.devices.describeSelf(current.state, { capabilities: bad })).toThrow('invalid ssh host key signature')
-    hub.devices.describeSelf(current.state, { capabilities: { ssh: { port: 22, hostKey, hostKeySignature: signature } } })
+    const ecdsa = 'ecdsa-sha2-nistp256 AAAAE2VjZHNh'
+    const ecdsaSignature = sign(null, Buffer.from(`ssh1:${ecdsa}`), device.privateKey).toString('base64')
+    const badList = { ssh: { port: 22, hostKey, hostKeySignature: signature, hostKeys: [{ hostKey: ecdsa, hostKeySignature: signature }] } }
+    expect(() => hub.devices.describeSelf(current.state, { capabilities: badList })).toThrow('invalid ssh host key signature')
+    hub.devices.describeSelf(current.state, {
+      capabilities: { ssh: { port: 22, hostKey, hostKeySignature: signature, hostKeys: [{ hostKey: ecdsa, hostKeySignature: ecdsaSignature }] } },
+    })
     expect((await listed(d => !!d?.capabilities?.ssh)).capabilities.ssh.hostKey).toBe(hostKey)
   })
 

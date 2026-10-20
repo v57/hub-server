@@ -149,6 +149,15 @@ describe('devices on the hub', () => {
     expect(await listed(id)).toMatchObject({ approved: true, online: true })
   })
 
+  test('a certificate works on a v0 connect too', async () => {
+    const device = makeKey()
+    const service = makeKey()
+    security.addOwner(device.key)
+    const c = client(() => ({ auth: token(service), v: '0', device: certificate(device, service, { deviceName: 'Old SDK' }) }))
+    await c.sender.send('hub/info')
+    expect(await listed(deviceId(device.key), d => d?.online)).toMatchObject({ name: 'Old SDK', approved: true })
+  })
+
   test('an owner device makes every service on it an owner', async () => {
     const device = makeKey()
     security.addOwner(device.key)
