@@ -26,15 +26,18 @@ export class NetworkRegistry {
       storagePath,
       () => this.data,
       data => {
+        const migrated = migrateRegistryData(data)
+        assertUniqueAllocations(migrated.allocations)
         this.needsMigration = data?.schemaVersion !== REGISTRY_SCHEMA_VERSION
-        this.data = migrateRegistryData(data)
-        assertUniqueAllocations(this.data.allocations)
+        this.data = migrated
       },
     )
   }
 
   async load(): Promise<this> {
     await this.storage.load()
+    // A corrupt registry stays empty and read-only: no identity, no new members
+    if (this.storage.corrupt) return this
     assertUniqueAllocations(this.data.allocations)
     const needsIdentity = !this.data.hubNetworkId
     if (needsIdentity) {
@@ -57,6 +60,7 @@ export class NetworkRegistry {
    */
   allocateAddresses(key: string): { ipv4: string; ipv6: string } {
     if (!key) throw new Error('profile key is required')
+    if (this.storage.corrupt) throw new Error('network registry is corrupt')
     if (this.data.allocations[key]) {
       const existing = this.data.allocations[key]
       return { ipv4: existing[0], ipv6: existing[1] }

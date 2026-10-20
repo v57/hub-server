@@ -104,7 +104,7 @@ export class Security implements SecurityInterface {
   group = new Group()
   owners = new Set<string>()
   launcher?: string
-  whitelist = new Whitelist()
+  whitelist = new Whitelist(user => this.owners.has(user))
 
   async load() {
     await Promise.all([
@@ -117,6 +117,17 @@ export class Security implements SecurityInterface {
     ])
     return this
   }
+  /** A security store failed to load: everything it would grant is denied, owners keep access */
+  get corrupt(): boolean {
+    return [
+      this.host.storage,
+      this.call.storage,
+      this.group.storage,
+      this.group.names.storage,
+      this.group.users.storage,
+      this.whitelist.storage,
+    ].some(storage => storage.corrupt)
+  }
   requireOwner(user: string | undefined, path: string): void {
     if (!this.allowsCall(user, path)) throw 'Permissions required'
   }
@@ -124,6 +135,7 @@ export class Security implements SecurityInterface {
     this.owners.add(user)
   }
   allowsCall(user: string | undefined, path: string): boolean {
+    if (this.corrupt) return this.isOwner(user)
     if (!this.group.allowsUser(user, path)) {
       if (!user) return false
       return this.call.allows(user, path) || this.owners.has(user)
@@ -135,12 +147,14 @@ export class Security implements SecurityInterface {
     if (path.startsWith('hub/')) return false
     if (this.launcher && path.startsWith('launcher/') && user === this.launcher) return true
     if (this.owners.has(user)) return true
+    if (this.corrupt) return false
     if (this.host.allows(user, path)) return true
     this.host.ask(user, path)
     return false
   }
   allowedApi(user: string | undefined, api: Set<string>): string[] {
     if (user && this.owners.has(user)) return Array.from(api)
+    if (this.corrupt) return []
     return Array.from(api.difference(this.group.restricted(user)))
   }
   userGroup(user: string | undefined): string | undefined {
@@ -167,13 +181,13 @@ export const authClockSkew = 30
 class Keys {
   verify(signedKey: string | undefined, whitelist: Whitelist): string | undefined {
     if (!signedKey?.length) {
-      if (whitelist.enabled) throw 'hub is not available'
+      if (whitelist.enforced) throw 'hub is not available'
       else return
     }
     const parts = signedKey.split('.')
     if (parts.length !== 4 || parts[0] !== 'key') throw 'invalid key'
     const [_, key, hash, time] = parts
-    if (whitelist.enabled && !whitelist.allows(key)) throw 'hub is not available'
+    if (whitelist.enforced && !whitelist.allows(key)) throw 'hub is not available'
     if (!this.verifyPub(key, hash, time)) throw 'invalid signature'
     return key
   }
@@ -475,6 +489,7 @@ class GroupNames {
 }
 
 class Whitelist {
+  constructor(private exempt: (user: string) => boolean = () => false) {}
   enabled: boolean = false
   private users = new Set<string>()
   storage = new Storage(
@@ -504,7 +519,13 @@ class Whitelist {
     this.subscription.setNeedsUpdate()
     this.storage.save()
   }
+  /** Enabled, or its file is corrupt and only exempt users (owners) get in */
+  get enforced(): boolean {
+    return this.enabled || this.storage.corrupt
+  }
   allows(user: string): boolean {
+    if (this.exempt(user)) return true
+    if (this.storage.corrupt) return false
     return this.users.has(user)
   }
   setEnabled(enabled: boolean | undefined) {
