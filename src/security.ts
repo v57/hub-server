@@ -159,6 +159,11 @@ export class Security implements SecurityInterface {
   }
 }
 
+// Longest auth token lifetime the hub accepts, in seconds
+export const authMaxLifetime = 5 * 60
+// Tolerated clock difference between signer and hub, in seconds
+export const authClockSkew = 30
+
 class Keys {
   verify(signedKey: string | undefined, whitelist: Whitelist): string | undefined {
     if (!signedKey?.length) {
@@ -174,10 +179,13 @@ class Keys {
   }
   // Can handle around 38k verifications per second
   private verifyPub(key: string, signature: string, time: string): boolean {
+    // Signers write the expiry as decimal Unix seconds (now + 10 by default, 60 in Swift)
+    if (!/^\d{1,12}$/.test(time)) throw 'invalid key'
+    const expiry = Number(time)
+    const now = Math.round(Date.now() / 1000)
+    if (expiry + authClockSkew <= now) throw 'authorization expired'
+    if (expiry > now + authMaxLifetime + authClockSkew) throw 'authorization expires too late'
     const pubKey = createPublicKey({ key: Buffer.from(key, 'base64'), format: 'der', type: 'spki' })
-    const s = parseInt(time, 36)
-    const now = Math.round(new Date().getTime() / 1000)
-    if (s <= now) throw 'authorization expired'
     const verified = verify(null, Buffer.from(time), pubKey, Buffer.from(signature, 'base64'))
     return verified
   }
