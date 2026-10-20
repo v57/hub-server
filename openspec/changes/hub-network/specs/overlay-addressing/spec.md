@@ -1,43 +1,43 @@
 ## ADDED Requirements
 
 ### Requirement: Overlay addresses are unique within a Hub network
-Hub SHALL maintain a persistent network identifier and allocate non-conflicting overlay addresses to registered network profiles.
+Hub MUST keep a persistent network ID and MUST allocate non-conflicting overlay addresses to registered network profiles.
 
-#### Scenario: Two agents join the same Hub
-- **WHEN** two distinct network profiles register
-- **THEN** Hub assigns different overlay addresses within that Hub network
+#### Scenario: Two agents join same Hub
+- **WHEN** two network profiles register
+- **THEN** Hub assign different overlay addresses within that Hub network
 
 ### Requirement: Names are stable and collision resistant
-Every stable resource SHALL have a canonical versioned authority derived from its share identity, owner identity, and Hub network identity rather than display names alone.
+A stable resource MUST have canonical versioned authority derived from share identity, owner identity, and Hub network identity, not display names alone.
 
-#### Scenario: Two services publish the same display name
-- **WHEN** different service identities publish shares named `s3`
-- **THEN** their canonical authorities remain distinct
+#### Scenario: Two services publish same display name
+- **WHEN** different services publish shares named `s3`
+- **THEN** canonical authorities stay distinct
 
-### Requirement: Resolution is private to an active profile
-`hub-net` SHALL resolve the reserved Hub Network namespace only while the corresponding network profile is active and authorized.
+### Requirement: Resolution private to active profile
+`hub-net` MUST resolve the reserved Hub Network namespace only while the corresponding network profile is active and authorized.
 
-#### Scenario: Agent is stopped
-- **WHEN** an application resolves a Hub Network authority after its profile stops
-- **THEN** the authority does not resolve to a publicly routable fallback
+#### Scenario: Agent stopped
+- **WHEN** application resolve Hub Network authority after profile stops
+- **THEN** authority not resolve to publicly routable fallback
 
-### Requirement: Non-Hub DNS is not captured unnecessarily
-The local resolver MUST limit authoritative handling to the reserved Hub Network namespace and MUST preserve normal resolution for unrelated names.
+### Requirement: Non-Hub DNS not captured unnecessarily
+Local resolver MUST limit authoritative handling to the reserved Hub Network namespace and MUST preserve normal resolution for unrelated names.
 
 #### Scenario: Public website lookup
-- **WHEN** an application resolves a name outside the Hub Network suffix
-- **THEN** `hub-net` does not synthesize an overlay response
+- **WHEN** application resolve name outside Hub Network suffix
+- **THEN** `hub-net` not synthesize overlay response
 
 ### Requirement: Provider selection precedes authorization
-Hub SHALL select a live provider for a stable resource before issuing a grant, and a caller MAY request a specific advertised provider.
+Hub MUST select a live provider for a stable resource before issuing a grant. Caller MAY request a specific advertised provider.
 
 #### Scenario: Default selection among replicas
-- **WHEN** several live providers implement one resource and the caller does not select one
-- **THEN** Hub chooses one available provider using the defined network provider-selection policy
+- **WHEN** several live providers implement one resource and caller not select
+- **THEN** Hub choose available provider using defined network provider-selection policy
 
-### Requirement: Overlay routes are scoped
-The initial `hub-net` profile SHALL route only allocated Hub Network prefixes and MUST NOT become a default internet route.
+### Requirement: Overlay routes scoped
+Initial `hub-net` profile route only allocated Hub Network prefixes. MUST NOT become default internet route.
 
 #### Scenario: Ordinary internet request
-- **WHEN** an application accesses a public internet address while the initial profile is active
-- **THEN** the request follows the existing non-Hub default route
+- **WHEN** application access public internet address while initial profile active
+- **THEN** request follow existing non-Hub default route
