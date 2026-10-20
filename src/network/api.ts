@@ -41,6 +41,7 @@ import type { Sender } from 'channel/server'
 import type { State } from '../hub'
 import { publicKey, signChallenge } from '../keychain'
 import { Security } from '../security'
+import type { Grant } from '../grants'
 import { createPublicKey } from 'crypto'
 import { LocalAgentBindingStore } from './local-agent'
 import type { AppleLocalAgentBinding } from './local-agent'
@@ -100,6 +101,7 @@ export class NetworkAPI {
 
   async load(): Promise<void> {
     await Promise.all([this.registry.load(), this.localAgent.load()])
+    if (!this.registry.storage.corrupt) this.migratePolicies()
     // Set hub key from keychain
     const key = await publicKey()
     if (key) {
@@ -236,7 +238,9 @@ export class NetworkAPI {
     // Apply the planned registrations atomically.
     const publications: NetworkSharePublication[] = []
     for (const [index, { resource, provider, publication }] of planned.entries()) {
+      const isNew = !this.registry.getResource(resource.resourceId)
       this.registry.registerResource(resource)
+      if (isNew) this.setPolicyGrants(resource, ownerKey)
       this.agents.registerProvider(provider, state.id)
       this.consumedAttestations.set(shares[index].attestation.attestationId, Date.parse(shares[index].attestation.expiresAt))
       publications.push(publication)
@@ -535,12 +539,7 @@ export class NetworkAPI {
       throw networkError('forbidden', 'caller WireGuard key does not match the registered profile', false)
     }
 
-    // Check authorization
-    const groupMembers = this.security.group.users.users(resource.policy.mode === 'group' ? resource.policy.group : '')
-    const isHubOwner = this.security.isOwner(state)
-    const isAuthorized = this.permissions.isAuthorized(callerKey, resource, isHubOwner, groupMembers)
-
-    if (!isAuthorized) {
+    if (!this.canAccessShare(resource, state)) {
       throw networkError('forbidden', 'not authorized for this resource', false)
     }
 
@@ -830,6 +829,7 @@ export class NetworkAPI {
     const unchanged = JSON.stringify(resource.policy) === JSON.stringify(policy)
     const generation = unchanged ? resource.generation : resource.generation + 1
     this.registry.updateResource(resourceId, policy, generation)
+    if (!unchanged) this.setPolicyGrants(resource, state.key)
     if (!unchanged) this.propagateGeneration(resourceId)
     this.onStateChanged?.()
 
@@ -867,8 +867,14 @@ export class NetworkAPI {
    * subsequent issuance is re-evaluated against the updated membership.
    */
   handleGroupMembershipChanged(group: string): void {
+    const shares = new Set(
+      this.security.grants.grants.flatMap(({ subject, object }) =>
+        'group' in subject && subject.group === group && 'share' in object ? [object.share] : [],
+      ),
+    )
     for (const resource of Object.values(this.registry.data.resources)) {
-      if (resource.policy.mode !== 'group' || resource.policy.group !== group) continue
+      const byPolicy = resource.policy.mode === 'group' && resource.policy.group === group
+      if (!byPolicy && !shares.has(resource.resourceId)) continue
       this.registry.incrementGeneration(resource.resourceId)
       this.propagateGeneration(resource.resourceId)
     }
@@ -878,6 +884,7 @@ export class NetworkAPI {
   handleGroupRenamed(group: string, name: string): void {
     for (const resource of Object.values(this.registry.data.resources)) {
       if (resource.policy.mode !== 'group' || resource.policy.group !== group) continue
+      // The group's grants were renamed with it, the stored policy follows
       const policy: NetworkPolicy = { mode: 'group', group: name }
       this.registry.updateResource(resource.resourceId, policy, resource.generation + 1)
       this.propagateGeneration(resource.resourceId)
@@ -1095,10 +1102,54 @@ export class NetworkAPI {
     if (!state.key) return false
     if (resource.ownerKey === state.key || this.security.isOwner(state)) return true
 
-    const key = this.agents.getProfile(state.key)?.key
-    if (!key) return false
-    const groupMembers = this.security.group.users.users(resource.policy.mode === 'group' ? resource.policy.group : '')
-    return this.permissions.isAuthorized(key, resource, false, groupMembers)
+    if (!this.agents.getProfile(state.key)) return false
+    return this.canAccessShare(resource, state)
+  }
+
+  /**
+   * Share access is a grant (protocol.md section 9): owners and the share's own service always, unless the share
+   * is disabled; anyone else needs a `{ share }` grant for their key, device, groups or everyone.
+   */
+  private canAccessShare(resource: NetworkResource, state: State): boolean {
+    if (resource.policy.mode === 'disabled' || !state.key) return false
+    if (this.security.isOwner(state) || resource.ownerKey === state.key) return true
+    return this.security.grants.allowsShare(this.security.caller(state), resource.resourceId)
+  }
+
+  /** Grants a share policy stands for: hub → everyone, group → the group, keys → each key, private → none */
+  private setPolicyGrants(resource: NetworkResource, by: string): void {
+    this.applyingPolicy = true
+    try {
+      this.security.grants.removeWhere(({ object }) => 'share' in object && object.share === resource.resourceId)
+      const object = { share: resource.resourceId }
+      const policy = resource.policy
+      if (policy.mode === 'hub') this.security.grants.add({ everyone: true }, object, by)
+      if (policy.mode === 'group') this.security.grants.add({ group: policy.group }, object, by)
+      if (policy.mode === 'keys') for (const key of policy.keys) this.security.grants.add({ key }, object, by)
+    } finally {
+      this.applyingPolicy = false
+    }
+  }
+  private applyingPolicy = false
+
+  /** Share grants added or removed outside a policy update end flows of the old generation */
+  handleGrantsChanged(changed: Grant[]): void {
+    if (this.applyingPolicy) return
+    const shares = new Set(changed.flatMap(({ object }) => ('share' in object ? [object.share] : [])))
+    for (const resourceId of shares) {
+      if (!this.registry.getResource(resourceId)) continue
+      this.registry.incrementGeneration(resourceId)
+      this.propagateGeneration(resourceId)
+    }
+    if (shares.size) this.onStateChanged?.()
+  }
+
+  /** Turns stored share policies into grants once */
+  private migratePolicies(): void {
+    const grants = this.security.grants
+    if (grants.storage.corrupt || grants.migrated.includes('network')) return
+    for (const resource of Object.values(this.registry.data.resources)) this.setPolicyGrants(resource, 'migration')
+    grants.markMigrated('network')
   }
 
   /**

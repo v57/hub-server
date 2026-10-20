@@ -12,7 +12,7 @@ import {
   type StoredDevice,
 } from './devices'
 import { deviceId } from './devices'
-import { deviceMember, keyMember, type Security } from './security'
+import type { Security } from './security'
 
 /** A device as `hub/devices` lists it (protocol.md section 6) */
 export interface Device {
@@ -168,11 +168,8 @@ export class HubDevices {
       const { state } = connection
       if (state.certificate?.deviceId === id || (state.key && revoked.has(state.key))) connection.sender.stop()
     }
-    this.security.members.removeEverywhere(deviceMember(id))
-    for (const key of revokedKeys) {
-      this.security.members.removeEverywhere(keyMember(key))
-      this.security.revokeKey(key)
-    }
+    this.security.removeDevice(id)
+    for (const key of revokedKeys) this.security.revokeKey(key)
     this.setNeedsUpdate()
     this.hub.connectionsChanged()
   }

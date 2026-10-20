@@ -3,6 +3,7 @@ import { createPublicKey, verify } from 'crypto'
 import { Storage, settings, type SecurityMode } from './settings'
 import { deviceId } from './devices'
 import { LazyState } from 'channel/more'
+import { GrantStore, parseObject, parseSubject, type Grant } from './grants'
 
 interface SecurityInterface {
   requireOwner(user: Caller | Principal | string | undefined, path: string): void
@@ -26,29 +27,27 @@ interface SecurityInterface {
     pendingUsers(): string[]
   }
 
-  // Call api
+  // Call api, key grants
   call: {
     allows(user: string, path: string): boolean
     ask(user: string, path: string): void
-    allow(user: string, paths: string[]): void
+    allow(user: string, paths: string[], by?: string): void
+    revoke(user: string, paths: string[] | undefined): void
     allowed(user: string): Set<string>
     pending(user: string): Set<string>
   }
 
-  // Groups
+  // Groups, group grants and members
   group: {
-    allowsUser(user: string, path: string): boolean
-    restricted(user: string | undefined): Set<string>
-
-    allows(group: string, path: string): boolean
-    create(group: string): void
+    lists(group: string, path: string): boolean
+    create(group: unknown): string
     remove(group: string): void
     rename(group: string, name: string): void
-    update(group: string, add: string[], remove: string[]): void
-    replace(group: string, paths: string[]): void
+    update(group: string, add: string[] | undefined, remove: string[] | undefined, by?: string): void
+    replace(group: string, paths: string[], by?: string): void
     allowed(group: string): Set<string>
 
-    // User groups
+    // Group members
     users: {
       group(user: string): string | undefined
       users(group: string): Set<string>
@@ -158,7 +157,17 @@ export const deviceMember = (id: string) => `device:${id}`
  */
 class Members {
   private groups = new Map<string, Set<string>>()
-  subscription = new LazyState<Record<string, string[]>>(() => this.encodeGroups())
+  /** `hub/group/users`: group → members, keys as plain SPKIs as before */
+  subscription = new LazyState<Record<string, string[]>>(() =>
+    Object.fromEntries(
+      Array.from(this.groups, ([group, members]) => [
+        group,
+        Array.from(members, member => (member.startsWith('key:') ? member.slice(4) : member)),
+      ]),
+    ),
+  )
+  /** Membership changed, with the group */
+  onChange?: (group: string) => void
   storage = new Storage(
     'data/group-members.json',
     () => ({ schema: 1, groups: this.encodeGroups() }),
@@ -191,30 +200,41 @@ class Members {
     if (!members) this.groups.set(group, (members = new Set()))
     if (members.has(member)) return
     members.add(member)
-    this.changed()
+    this.changed(group)
   }
   remove(group: string, member: string) {
     if (!this.groups.get(group)?.delete(member)) return
-    this.changed()
+    this.changed(group)
   }
   /** Takes the member out of every group */
   removeEverywhere(member: string) {
-    let changed = false
-    for (const members of this.groups.values()) changed = members.delete(member) || changed
-    if (changed) this.changed()
+    for (const [group, members] of this.groups) if (members.delete(member)) this.changed(group)
   }
-  private changed() {
+  removeGroup(group: string) {
+    if (group === ownersGroup || !this.groups.delete(group)) return
+    this.changed(group)
+  }
+  renameGroup(from: string, to: string) {
+    const members = this.groups.get(from)
+    if (!members || from === ownersGroup) return
+    this.groups.delete(from)
+    this.groups.set(to, members)
+    this.changed(to)
+  }
+  private changed(group: string) {
     this.subscription.setNeedsUpdate()
     this.storage.save()
+    this.onChange?.(group)
   }
 }
 
 export class Security implements SecurityInterface {
   keys = new Keys()
   host = new Host()
-  call = new Call()
-  group = new Group()
+  grants = new GrantStore()
   members = new Members()
+  call = new Call(this.grants)
+  group = new Group(this.grants, this.members)
   launcher?: string
   whitelist = new Whitelist(user => this.isOwner(user))
   /** Device names for `caller.device`, set by the hub */
@@ -235,14 +255,57 @@ export class Security implements SecurityInterface {
       this.group.users.storage.load(),
       this.whitelist.storage.load(),
       this.members.storage.load(),
+      this.grants.storage.load(),
     ])
+    this.migrate()
     this.mode = settings.data.security.mode
     this.requireV1 = settings.data.security.requireV1
     // An empty path list or whitelist opens the hub, so a corrupt one locks it down instead
     // An empty owners group keeps owners out, so a corrupt one also locks down until the startup owners return
-    const stores = [settings.storage, this.group.names.storage, this.whitelist.storage, this.members.storage]
+    const stores = [
+      settings.storage,
+      this.group.names.storage,
+      this.whitelist.storage,
+      this.members.storage,
+      this.grants.storage,
+    ]
     if (stores.some(storage => storage.corrupt)) this.lockDown()
     return this
+  }
+  /**
+   * Turns the old call lists, group path lists and one-group-per-key users into grants and members, once each.
+   * Skipped while `grants.json` is corrupt, so old lists don't come back over a newer state.
+   */
+  private migrate() {
+    if (this.grants.storage.corrupt) return
+    const migrated = this.grants.migrated
+    if (!migrated.includes('clients')) {
+      this.call.legacy.forEach((key, paths) => paths.forEach(path => this.grants.add({ key }, { path }, 'migration')))
+      this.grants.markMigrated('clients')
+    }
+    if (!migrated.includes('groups')) {
+      for (const [group, paths] of Object.entries(this.group.legacyPaths ?? {})) {
+        if (!Array.isArray(paths)) continue
+        for (const path of paths) this.grants.add({ group }, { path }, 'migration')
+      }
+      this.grants.markMigrated('groups')
+      if (this.group.legacyPaths) this.group.changed()
+    }
+    if (!migrated.includes('group_users')) {
+      this.group.users.legacy.forEach((group, users) => users.forEach(user => this.members.add(group, keyMember(user))))
+      this.grants.markMigrated('group_users')
+    }
+  }
+  /** `hub/grant/add` */
+  addGrant(body: any, by: Who): Grant {
+    const subject = parseSubject(body?.subject)
+    const object = parseObject(body?.object)
+    return this.grants.add(subject, object, this.asCaller(by).key ?? 'owner')
+  }
+  /** Removes grants naming a removed device and drops it from every group */
+  removeDevice(id: string) {
+    this.grants.removeWhere(({ subject }) => 'device' in subject && subject.device === id)
+    this.members.removeEverywhere(deviceMember(id))
   }
   /** Only owners may call service paths, and the hub stays `default-deny` after a restart */
   lockDown() {
@@ -288,10 +351,7 @@ export class Security implements SecurityInterface {
   }
   /** Every group the key or its device belongs to, `owners` first */
   groups(principal: Principal): string[] {
-    const groups = this.members.groupsOf(principal)
-    const group = principal.key ? this.group.users.group(principal.key) : undefined
-    if (group && !groups.includes(group)) groups.push(group)
-    return groups.sort((a, b) => (a === ownersGroup ? -1 : b === ownersGroup ? 1 : 0))
+    return this.members.groupsOf(principal).sort((a, b) => (a === ownersGroup ? -1 : b === ownersGroup ? 1 : 0))
   }
   /**
    * A call to a service path. Owners always; then grants (per-key call lists and group path lists); then in
@@ -305,10 +365,9 @@ export class Security implements SecurityInterface {
     if (this.mode === 'default-deny') return isPublic
     return !this.group.names.contains(path)
   }
-  /** Whether a grant (per-key call list or a group's path list) names this path for the caller */
+  /** Whether a grant for the caller's key, device, groups or everyone names the path */
   granted(caller: Caller, path: string): boolean {
-    if (caller.key && this.call.allows(caller.key, path)) return true
-    return caller.groups.some(group => this.group.lists(group, path))
+    return this.grants.allowsPath(caller, path)
   }
   /** Access check for a built-in path, throws `permissions required` */
   checkBuiltin(caller: Caller, path: string, access = builtinAccess(path)) {
@@ -360,14 +419,13 @@ export class Security implements SecurityInterface {
     if (!user) return
     return this.group.users.group(user)
   }
-  /** Drops what a revoked key was granted: call and host lists and its group */
+  /** Drops what a revoked key was granted: its grants, hosting approvals and group memberships */
   revokeKey(key: string) {
-    this.call.revoke(key, Array.from(this.call.allowed(key)))
+    this.grants.removeWhere(({ subject }) => 'key' in subject && subject.key === key)
     this.call.pendingList.deleteAll(key)
     this.host.revoke(key, Array.from(this.host.allowed(key)))
     this.host.pendingList.deleteAll(key)
-    const group = this.group.users.group(key)
-    if (group) this.group.users.remove(key, group)
+    this.members.removeEverywhere(keyMember(key))
   }
   /** A member of `owners` by key, or by the device the connection is attached to */
   isOwner(who: Who): boolean {
@@ -481,177 +539,213 @@ class Host {
   }
 }
 
+/**
+ * Per-key call permissions, now key grants for single paths. `data/clients.json` is read once to migrate it.
+ * Pending requests stay in memory.
+ */
 class Call {
-  allowedList = new MapSet<string>()
   pendingList = new MapSet<string>()
   pendingSubscription = new LazyState(() => this.pendingList.encode())
+  /** The old per-key lists, only read for migration */
+  legacy = new MapSet<string>()
   storage = new Storage(
     'data/clients.json',
-    () => ({
-      allowed: this.allowedList.encode(),
-    }),
-    data => this.allowedList.decode(data?.allowed),
+    () => ({ allowed: this.legacy.encode() }),
+    data => this.legacy.decode(data?.allowed),
   )
+  constructor(private grants: GrantStore) {}
   allows(user: string, path: string): boolean {
-    return this.allowedList.has(user, path)
+    return this.grants.paths({ key: user }).has(path)
   }
   ask(user: string, path: string): void {
     this.pendingList.set(user, path)
     this.pendingSubscription.setNeedsUpdate()
   }
-  allow(user: string, paths: string[] | undefined): void {
+  allow(user: string, paths: string[] | undefined, by = 'owner'): void {
     if (!paths?.length) return
     for (const path of paths) {
       this.pendingList.delete(user, path)
-      this.pendingSubscription.setNeedsUpdate()
-      this.allowedList.set(user, path)
+      this.grants.add({ key: user }, { path }, by)
     }
-    this.storage.save()
+    this.pendingSubscription.setNeedsUpdate()
   }
   revoke(user: string, paths: string[] | undefined): void {
     if (!paths?.length) return
-    for (const path of paths) {
-      this.pendingList.set(user, path)
-      this.pendingSubscription.setNeedsUpdate()
-      this.allowedList.delete(user, path)
-    }
-    this.storage.save()
+    const revoked = new Set(paths)
+    for (const path of paths) this.pendingList.set(user, path)
+    this.grants.removeWhere(
+      ({ subject, object }) => 'key' in subject && subject.key === user && 'path' in object && revoked.has(object.path),
+    )
+    this.pendingSubscription.setNeedsUpdate()
   }
   allowed(user: string): Set<string> {
-    return this.allowedList.get(user) ?? new Set()
+    return this.grants.paths({ key: user })
   }
   pending(user: string): Set<string> {
     return this.pendingList.get(user) ?? new Set()
   }
 }
 
+export interface GroupInfo {
+  id: string
+  /** A person: a group of the devices and keys of one person */
+  person: boolean
+  members: string[]
+  /** Paths granted to the group, as the old path lists */
+  paths: string[]
+}
+
+/**
+ * Groups by id (their name). `data/groups.json` keeps which groups exist and whether they are people; what a group
+ * may call are group grants and who is in it are members in `data/group-members.json`. The old format (group →
+ * paths) is migrated to grants once.
+ */
 class Group {
-  private groups = new MapSet<string>()
-  users = new GroupUsers()
+  private groups = new Map<string, { person?: boolean }>()
+  /** Path lists of the old format, only read for migration */
+  legacyPaths?: Record<string, string[]>
+  users: GroupUsers
   names = new GroupNames()
   storage = new Storage(
     'data/groups.json',
-    () => this.groups.encode(),
-    data => this.groups.decode(data),
+    () => ({ schema: 1, groups: Object.fromEntries(this.groups) }),
+    data => {
+      if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('not an object')
+      if (data.schema === undefined) {
+        this.legacyPaths = data
+        this.groups = new Map(Object.keys(data).map(group => [group, {}]))
+      } else {
+        if (data.schema !== 1) throw new Error(`unsupported groups schema ${data.schema}`)
+        this.groups = new Map(Object.entries(data.groups ?? {}).map(([group, info]: [string, any]) => [group, info?.person ? { person: true } : {}]))
+      }
+    },
   )
-  subscription = new LazyState<any>(() => {
-    return this.groups.encode()
-  })
-  allowsUser(user: string | undefined, path: string): boolean {
-    if (!this.names.contains(path)) return true
-    if (!user) return false
-    const group = this.users.group(user)
-    if (!group) return false
-    return this.allows(group, path)
+  /** `hub/group/list`: group → granted paths, as before */
+  subscription = new LazyState<any>(() =>
+    Object.fromEntries(Array.from(this.groups.keys(), group => [group, Array.from(this.allowed(group))])),
+  )
+  /** `hub/groups`: every group with its kind, members and paths */
+  infoSubscription = new LazyState<GroupInfo[]>(() => this.list())
+  constructor(
+    private grants: GrantStore,
+    private members: Members,
+  ) {
+    this.users = new GroupUsers(members)
   }
-  restricted(user: string | undefined): Set<string> {
-    let restricted = this.names.restricted
-    if (!user) return restricted
-    const group = this.users.group(user)
-    if (!group) return restricted
-    return restricted.difference(this.allowed(group))
-  }
-  allows(group: string, path: string): boolean {
-    if (!this.names.contains(path)) return true
-    return this.groups.has(group, path)
-  }
-  /** Whether the group's path list names the path */
+  /** Whether the group's grants name the path */
   lists(group: string, path: string): boolean {
-    return this.groups.has(group, path)
+    return this.grants.allowsPath({ groups: [group] }, path)
   }
-  create(group: string): void {
-    if (!this.groups.hasKey(group)) {
-      this.groups.replace(group, new Set())
-      this.subscription.setNeedsUpdate()
-      this.storage.save()
-    }
+  has(group: string): boolean {
+    return this.groups.has(group) || group === ownersGroup
+  }
+  create(value: unknown): string {
+    const { name, person } =
+      typeof value === 'string' ? { name: value, person: false } : ((value ?? {}) as { name?: unknown; person?: unknown })
+    if (typeof name !== 'string' || !name.trim()) throw 'invalid group'
+    if (name === ownersGroup || this.groups.has(name)) return name
+    this.groups.set(name, person === true ? { person: true } : {})
+    this.changed()
+    return name
   }
   remove(group: string): void {
-    const removed = this.groups.deleteAll(group)
+    if (group === ownersGroup) throw 'owners can not be removed'
+    const existed = this.groups.delete(group)
     this.users.removeGroup(group)
-    if (removed) {
-      this.subscription.setNeedsUpdate()
-      this.storage.save()
-    }
+    this.grants.removeWhere(({ subject }) => 'group' in subject && subject.group === group)
+    if (existed) this.changed()
   }
   rename(group: string, name: string): void {
+    if (group === ownersGroup || name === ownersGroup) throw 'owners can not be renamed'
+    if (typeof name !== 'string' || !name.trim() || this.groups.has(name)) throw 'invalid group'
+    const info = this.groups.get(group)
+    if (!info) return
+    this.groups.delete(group)
+    this.groups.set(name, info)
     this.users.rename(group, name)
-    const paths = this.groups.move(group, name)
-    if (!paths) return
-    this.subscription.setNeedsUpdate()
-    this.storage.save()
+    this.grants.renameSubject({ group }, { group: name })
+    this.changed()
   }
-  update(group: string, add: string[], remove: string[]): void {
-    const paths = this.groups.get(group)
-    if (!paths) return
-    add.forEach(path => paths.add(path))
-    remove.forEach(path => paths.delete(path))
-    this.subscription.setNeedsUpdate()
-    this.storage.save()
+  update(group: string, add: string[] | undefined, remove: string[] | undefined, by = 'owner'): void {
+    if (!this.has(group)) return
+    add?.forEach(path => this.grants.add({ group }, { path }, by))
+    const removed = new Set(remove ?? [])
+    if (removed.size) {
+      this.grants.removeWhere(
+        ({ subject, object }) => 'group' in subject && subject.group === group && 'path' in object && removed.has(object.path),
+      )
+    }
+    this.changed()
   }
-  replace(group: string, paths: string[]): void {
-    this.groups.replace(group, new Set(paths))
-    this.subscription.setNeedsUpdate()
-    this.storage.save()
+  replace(group: string, paths: string[], by = 'owner'): void {
+    if (!this.has(group)) this.groups.set(group, {})
+    const current = this.allowed(group)
+    const next = new Set(paths)
+    this.update(group, Array.from(next.difference(current)), Array.from(current.difference(next)), by)
   }
   allowed(group: string): Set<string> {
-    return this.groups.get(group) ?? new Set<string>()
+    return this.grants.paths({ group })
+  }
+  list(): GroupInfo[] {
+    const ids = [ownersGroup, ...Array.from(this.groups.keys()).filter(group => group !== ownersGroup)]
+    return ids.map(id => ({
+      id,
+      person: this.groups.get(id)?.person === true,
+      members: Array.from(this.members.members(id)),
+      paths: Array.from(this.allowed(id)),
+    }))
+  }
+  changed() {
+    this.subscription.setNeedsUpdate()
+    this.infoSubscription.setNeedsUpdate()
+    this.storage.save()
   }
 }
 
+/** A member string from an API value: `key:<SPKI>`, `device:<id>`, or a plain SPKI meaning `key:` */
+export function memberString(value: string): string {
+  return value.startsWith('key:') || value.startsWith('device:') ? value : keyMember(value)
+}
+
+/**
+ * Group membership on top of `Members`, so a key or device can be in any number of groups. The old
+ * `data/group_users.json` (one group per key) is migrated once. Plain SPKIs are `key:` members.
+ */
 class GroupUsers {
-  private groupUsers = new MapSet<string>()
-  private userGroups = new ObjectMap<string, string>()
+  /** The old group → users lists, only read for migration */
+  legacy = new MapSet<string>()
   storage = new Storage(
     'data/group_users.json',
-    () => this.groupUsers.encode(),
-    data => {
-      this.groupUsers.decode(data)
-      this.groupUsers.forEach((group, users) => {
-        users.forEach((user: string) => this.userGroups.set(user, group))
-      })
-    },
+    () => this.legacy.encode(),
+    data => this.legacy.decode(data),
   )
-  subscription = new LazyState<any>(() => this.groupUsers.encode())
-  group(user: string): string | undefined {
-    return this.userGroups.get(user)
+  constructor(private members: Members) {}
+  get subscription() {
+    return this.members.subscription
   }
+  /** The first group of the key other than owners, for connection lists */
+  group(user: string): string | undefined {
+    return this.members.groupsOf({ key: user }).find(group => group !== ownersGroup)
+  }
+  /** Keys (plain SPKI) and devices (`device:<id>`) in the group */
   users(group: string): Set<string> {
-    return this.groupUsers.get(group)
+    return new Set(Array.from(this.members.members(group), member => (member.startsWith('key:') ? member.slice(4) : member)))
   }
   edit(group: string, add: string[] | undefined, remove: string[] | undefined) {
     add?.forEach(user => this.add(user, group))
     remove?.forEach(user => this.remove(user, group))
   }
   add(user: string, group: string): void {
-    const oldValue = this.userGroups.get(user)
-    if (oldValue === group) return
-    if (oldValue) this.groupUsers.delete(oldValue, user)
-    this.groupUsers.set(group, user)
-    this.userGroups.set(user, group)
-    this.subscription.setNeedsUpdate()
-    this.storage.save()
+    this.members.add(group, memberString(user))
   }
   remove(user: string, group: string): void {
-    this.userGroups.delete(user)
-    this.groupUsers.delete(group, user)
-    this.subscription.setNeedsUpdate()
-    this.storage.save()
+    this.members.remove(group, memberString(user))
   }
   removeGroup(group: string) {
-    const set = this.groupUsers.get(group)
-    if (!set.size) return
-    set.forEach(user => this.userGroups.delete(user))
-    this.groupUsers.deleteAll(group)
-    this.subscription.setNeedsUpdate()
-    this.storage.save()
+    this.members.removeGroup(group)
   }
   rename(oldValue: string, group: string): void {
-    const users = this.groupUsers.move(oldValue, group)
-    if (!users) return
-    users.forEach(user => this.userGroups.set(user, group))
-    this.subscription.setNeedsUpdate()
-    this.storage.save()
+    this.members.renameGroup(oldValue, group)
   }
 }
 

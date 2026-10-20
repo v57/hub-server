@@ -125,6 +125,16 @@ export class Hub {
     networkAPI.deviceLabel = id => this.devices.registry.device(id)?.name
     this.devices.networkState = id => networkAPI.deviceNetworkState(id)
     this.devices.onRemoved = ({ id, revokedKeys }) => networkAPI.removeDevice(id, revokedKeys)
+    // Grants and group membership decide calls, `hub/api` lists and share connections
+    security.grants.onChange = changed => {
+      networkAPI.handleGrantsChanged(changed)
+      this.connectionsChanged()
+    }
+    security.members.onChange = group => {
+      networkAPI.handleGroupMembershipChanged(group)
+      security.group.infoSubscription.setNeedsUpdate()
+      this.connectionsChanged()
+    }
     this.ready = Promise.all([
       networkAPI.load(),
       this.header.load(),
@@ -283,8 +293,9 @@ export class Hub {
       })
       .post('hub/call/update', async ({ body: { key, allow, revoke }, state, path }) => {
         security.requireOwner(state, path)
-        security.call.allow(key, allow)
+        security.call.allow(key, allow, state.key)
         security.call.revoke(key, revoke)
+        sendUpdates()
       })
       .stream('hub/call/pending', ({ state, path }) => {
         security.requireOwner(state, path)
@@ -294,14 +305,15 @@ export class Hub {
         security.requireOwner(state, path)
         return Array.from(security.call.allowed(key))
       })
-      .post('hub/group/create', async ({ body: name, state, path }) => {
+      .post('hub/group/create', async ({ body, state, path }) => {
         security.requireOwner(state, path)
-        security.group.create(name)
+        return security.group.create(body)
       })
       .post('hub/group/rename', async ({ body: { group, name }, state, path }) => {
         security.requireOwner(state, path)
         security.group.rename(group, name)
         this.networkAPI?.handleGroupRenamed(group, name)
+        security.members.subscription.setNeedsUpdate()
         connectionsState.setNeedsUpdate()
       })
       .post('hub/group/remove', async ({ body: group, state, path }) => {
@@ -312,10 +324,11 @@ export class Hub {
       .post('hub/group/update', async ({ body: { group, add, remove, set }, state, path }) => {
         security.requireOwner(state, path)
         if (set) {
-          security.group.replace(group, set)
+          security.group.replace(group, set, state.key)
         } else {
-          security.group.update(group, add, remove)
+          security.group.update(group, add, remove, state.key)
         }
+        sendUpdates()
       })
       .post('hub/group/update/users', async ({ body: { group, add, remove }, state, path }) => {
         security.requireOwner(state, path)
@@ -343,6 +356,12 @@ export class Hub {
       .stream('hub/group/list', () => security.group.subscription.makeIterator())
       .stream('hub/group/users', () => security.group.users.subscription.makeIterator())
       .stream('hub/group/names', () => security.group.names.subscription.makeIterator())
+      .stream('hub/groups', () => security.group.infoSubscription.makeIterator())
+      .stream('hub/grants', () => security.grants.subscription.makeIterator())
+      .post('hub/grant/add', ({ body, state }) => security.addGrant(body, state))
+      .post('hub/grant/remove', ({ body }) => {
+        if (!security.grants.remove(body?.id)) throw 'grant not found'
+      })
       .post('hub/whitelist', async ({ body: { enabled, add, remove, allowsCurrent }, state, path }) => {
         security.requireOwner(state, path)
         security.whitelist.setEnabled(enabled)
