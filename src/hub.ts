@@ -7,7 +7,7 @@ import { publicKey } from './keychain.ts'
 import * as LoadBalancer from './load balancers.ts'
 import type { Cancellable } from 'channel/channel'
 import { Security, builtinAccess, deviceMember, keyMember, ownersGroup, type Caller, type Principal } from './security.ts'
-import { randomUUIDv7 } from 'bun'
+import { randomUUIDv7, type Server } from 'bun'
 import {
   appleAgentAPIsEnabled,
   appleAgentProtectedApi,
@@ -28,6 +28,17 @@ export const security = await new Security().load()
 security.hubKey = await publicKey()
 
 const paddr = (a?: string) => (a ? (isNaN(Number(a)) ? a : Number(a)) : 1997)
+
+/** The listen address on 127.0.0.1 only, keeping its port: `1997` and `0.0.0.0:1997` → `127.0.0.1:1997` */
+export function localAddress(address: number | string): string {
+  const port = typeof address === 'number' ? address : Number(address.slice(address.lastIndexOf(':') + 1))
+  return `127.0.0.1:${Number.isInteger(port) && port > 0 ? port : 1997}`
+}
+
+export interface HubOptions {
+  /** Local mode (`--local`, `HUB_MODE=local`): 127.0.0.1 only, `default-allow`, the launcher is an owner, no pairing */
+  local?: boolean
+}
 
 export interface State {
   id: string
@@ -73,6 +84,9 @@ export class Hub {
   hubNetNode = new HubNetNodeStore()
   devices = new HubDevices(this, security)
   pairing = new Pairing()
+  readonly local: boolean
+  /** The listening server, once ready */
+  server?: Server
   ready: Promise<void>
   apiList = new LazyStates<State, string[]>(state => this.allowedApi(security.caller(state)))
   /** Keyed by JSON `[key, device, path]` */
@@ -82,7 +96,12 @@ export class Hub {
   })
   /** Connections, their devices or their groups changed */
   connectionsChanged: () => void = () => {}
-  constructor(address = paddr(Bun.env.HUBLISTEN)) {
+  constructor(address: number | string = paddr(Bun.env.HUBLISTEN), options: HubOptions = {}) {
+    this.local = options.local === true
+    if (this.local) {
+      address = localAddress(address)
+      security.enableLocalMode()
+    }
     const services = this.services
     const hub = this
     const statusState = new FreshState<StatusState>(() => ({
@@ -144,7 +163,7 @@ export class Hub {
       this.header.load(),
       this.hubNetNode.load(),
       this.devices.load(security.hubKey),
-      this.pairing.load(),
+      this.local ? undefined : this.pairing.load(),
     ]).then(() => {
       hubNetNode.setNeedsUpdate()
     })
@@ -170,6 +189,7 @@ export class Hub {
         return { owner: true, hubKey: security.hubKey, name: (await this.header.load()).name }
       })
       .post('hub/pair/new', async ({ state, sender }) => {
+        if (this.local) throw 'no pairing in local mode'
         const launcher = !!security.launcher && state.key === security.launcher
         if (this.merger.connectionFor(sender) || !(launcher || security.isOwner(state))) throw 'permissions required'
         const code = await this.pairing.create()
@@ -471,7 +491,7 @@ export class Hub {
         this.devices.disconnected(state)
         if (state.device) this.devices.devicesState.setNeedsUpdate()
       })
-    this.ready.then(() => this.channel.listen(address, {
+    this.ready.then(() => (this.server = this.channel.listen(address, {
         async state(headers: Record<string, string | undefined>): Promise<State> {
           const key = security.keys.verify(headers['auth'] ?? undefined, security.whitelist, {
             version: headers['v'],
@@ -498,7 +518,7 @@ export class Hub {
           connectionsState.setNeedsUpdate()
           statusBadges.setNeedsUpdate()
         },
-      }))
+      })))
 
     this.api = new Set([...Object.keys(this.channel.postApi.storage), ...Object.keys(this.channel.streamApi.storage)])
     settings.data.merge.forEach(address => this.merger.connect(address, this))
@@ -506,9 +526,10 @@ export class Hub {
   stats() {
     this.services.map(a => a)
   }
-  /** At start: a pairing code when the hub has no owners or `force` (`--pair`), see `Pairing.start` */
+  /** At start: a pairing code when the hub has no owners or `force` (`--pair`), see `Pairing.start`. None in local mode. */
   async startPairing(force = false): Promise<string | undefined> {
     await this.ready
+    if (this.local) return
     return this.pairing.start({ needed: security.members.members(ownersGroup).size === 0, force })
   }
   /** `hub/pair` succeeded: the key and, with a certificate, its device (approved) join the owners */

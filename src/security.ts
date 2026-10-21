@@ -246,6 +246,8 @@ export class Security implements SecurityInterface {
   requireV1 = false
   /** A store that grants failed to load: only owners may call service paths until an owner sets the mode */
   lockdown = false
+  /** Local mode (protocol.md section 12): `default-allow`, and the launcher key is an owner without being stored */
+  local = false
 
   async load() {
     await Promise.all([
@@ -313,6 +315,15 @@ export class Security implements SecurityInterface {
     this.lockdown = true
     this.setMode({ mode: 'default-deny' }, false)
   }
+  /** Local mode for development on one machine. Changes nothing in `data/hub.json`. */
+  enableLocalMode() {
+    this.local = true
+    this.mode = 'default-allow'
+  }
+  /** The launcher key in local mode */
+  private isLocalOwner(key: string | undefined): boolean {
+    return this.local && !!key && !!this.launcher && key === this.launcher
+  }
   /** `default-deny` while locked down */
   get effectiveMode(): SecurityMode {
     return this.lockdown ? 'default-deny' : this.mode
@@ -352,7 +363,9 @@ export class Security implements SecurityInterface {
   }
   /** Every group the key or its device belongs to, `owners` first */
   groups(principal: Principal): string[] {
-    return this.members.groupsOf(principal).sort((a, b) => (a === ownersGroup ? -1 : b === ownersGroup ? 1 : 0))
+    const groups = this.members.groupsOf(principal)
+    if (this.isLocalOwner(principal.key) && !groups.includes(ownersGroup)) groups.push(ownersGroup)
+    return groups.sort((a, b) => (a === ownersGroup ? -1 : b === ownersGroup ? 1 : 0))
   }
   /**
    * A call to a service path. Owners always; then grants (per-key call lists and group path lists); then in
@@ -432,10 +445,11 @@ export class Security implements SecurityInterface {
   /** A member of `owners` by key, or by the device the connection is attached to */
   isOwner(who: Who): boolean {
     if (!who) return false
-    if (typeof who === 'string') return this.members.has(ownersGroup, keyMember(who))
+    if (typeof who === 'string') return this.members.has(ownersGroup, keyMember(who)) || this.isLocalOwner(who)
     if (Array.isArray((who as Caller).groups)) return (who as Caller).owner
     const principal = who as Principal
     return (
+      this.isLocalOwner(principal.key) ||
       (!!principal.key && this.members.has(ownersGroup, keyMember(principal.key))) ||
       (!!principal.device && this.members.has(ownersGroup, deviceMember(principal.device)))
     )

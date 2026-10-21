@@ -28,10 +28,12 @@ bun i && bun .
 - `--owner <id>`: set owner key.
 - `--launcher <id>`: sets launcher key that allowed to host `launcher/*` APIs.
 - `--pair`: print a new pairing code, replacing the old one.
+- `--local`: local mode, see below.
 ## Environment
 - `HUBLISTEN`: default listen address or port.
 - `HUBOWNER`: owner key to trust at startup.
 - `HUBLAUNCHER`: launcher key to trust at startup.
+- `HUB_MODE=local`: local mode, like `--local`.
 ## Pairing
 A hub without owners prints a pairing code at start (`Pairing code: K7Q-2MX`) and writes it to `data/pairing-code`.
 The first client to send it becomes an owner:
@@ -44,6 +46,11 @@ The first client to send it becomes an owner:
 A code is 6 symbols of Crockford base32, valid for one hour and one success. Every check takes at least 1 s and checks
 run one at a time, and 10 wrong codes invalidate the code. Only its scrypt hash is stored (`data/pairing.json`). A
 still-valid code survives restarts; `--pair` replaces it.
+
+## Local mode
+`--local` (or `HUB_MODE=local`) is for development on one machine: the hub listens on `127.0.0.1` only (never other
+interfaces), runs `default-allow`, treats the launcher key (`HUBLAUNCHER`) as an owner and makes no pairing code. None of
+this is written to `data/`, so the same hub started normally keeps its stored mode and owners.
 
 ## Load balancers:
 - `random` will call random service

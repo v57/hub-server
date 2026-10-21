@@ -7,6 +7,8 @@ Options:
   --proxy <address>      join another hub as a proxy
   --owner <key>          trust this key as an owner (env HUBOWNER)
   --launcher <key>       let this key host launcher/* (env HUBLAUNCHER)
+  --local                local mode: 127.0.0.1 only, default-allow, the launcher key is an owner, no pairing
+                         (env HUB_MODE=local)
   --pair                 print a new pairing code, replacing the old one (a hub without owners makes one anyway)
   -h, --help             print this help`
 
@@ -16,6 +18,7 @@ let proxies: string[] = []
 let owners: string[] = []
 let launcher = Bun.env['HUBLAUNCHER']
 let pair = false
+let local = Bun.env['HUB_MODE'] === 'local'
 const argv = process.argv.slice(2)
 while (true) {
   const command = argv.shift()
@@ -40,6 +43,9 @@ while (true) {
     case '--launcher':
       launcher = argv.shift()
       break
+    case '--local':
+      local = true
+      break
     case '--pair':
       pair = true
       break
@@ -59,7 +65,7 @@ const { Hub, security } = await import('./src/hub')
 owners.forEach(id => security.addOwner(id))
 if (launcher?.length) security.launcher = launcher
 
-const hub = new Hub(port)
+const hub = new Hub(port, { local })
 hub.startPairing(pair).catch(error => console.error('Pairing code unavailable:', error))
 merges.forEach(address => {
   hub.merger.connect(address, hub, false)
