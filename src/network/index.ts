@@ -1,4 +1,4 @@
-// Hub Network module for hub-pro
+// Hub Network module for hub-server
 //
 // This module implements the Hub Network control plane including:
 // - Protocol foundations (DNS suffix, overlay ranges, resource IDs)

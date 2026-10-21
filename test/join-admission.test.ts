@@ -38,7 +38,7 @@ describe('validateJoinAdmission', () => {
 describe('hub/net/bind join', () => {
   beforeAll(() => {
     // NetworkRegistry persists to data/network.json relative to cwd.
-    process.chdir(mkdtempSync(join(tmpdir(), 'hub-pro-join-')))
+    process.chdir(mkdtempSync(join(tmpdir(), 'hub-server-join-')))
   })
 
   const state = (key: string, id: string) => ({ key, id }) as unknown as State

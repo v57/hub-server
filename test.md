@@ -51,7 +51,7 @@ post `net/revoke` String -> Void
 Revokes key and kicks from network
 Permission name: Hub Network -> Revoke access
 
-# Hub Pro
+# Hub Server
 stream `hub/net/list Void -> [HubNetInfo]`
 Returns list of agents in format:
 ```ts
@@ -72,13 +72,13 @@ Connection state now should have ip address to separate devices and see which on
 
 # Flows
 ## hub-net on adding hub connection / Hub App when Join Network toggled on this hub
-agent: Service connects to hub-pro and announces its services (just like all services do, nothing changes)
+agent: Service connects to hub-server and announces its services (just like all services do, nothing changes)
 pro: sends update to `hub/net/list` when see `hub/net` api registration
 agent: Subscribes to `hub/net/node`, authorizes with provided `hub-net-node` (with its service public key)
 
 ## Create Invite
 client: Subscribes to `hub/net/list`, displays list of agents. `Copy Invite` button appears in front of agent that have 127.0.0.1 `HubNetInfo.localIp` (when `net/invite` api is available)
-client: `Copy Invite` sends `net/invite` with `context.service: HubNetInfo.id` (hub-pro can already pass this request to a proper service)
+client: `Copy Invite` sends `net/invite` with `context.service: HubNetInfo.id` (hub-server can already pass this request to a proper service)
 agent: Generates code in format `$publicKey.$expires.$nonce?query` signs and appends signature `$publicKey.$expires.$nonce?query/$signature`
 - nonce: 32bit random number in base64
 - expires: 32bit unix timestamp (1 week duration)
@@ -92,7 +92,7 @@ client: Converts that code to `hub://join/$publicKey.$expires.$nonce?query/$sign
 client: Opens link, parses all data, verifies signature
 client: Sends that link to `hub-net-node` at provided or default endpoint
 hub-net-node: Extracts data, verifies (format, signature, expires in less than 8 days, agent online), makes sha256 hash of this code, checks if it's used, adds to in-memory list of used list that will automatically flush after expiration date. Connects it to agent
-client: After connecting to agent, connects to `hub-pro` at agent.ip:1997
+client: After connecting to agent, connects to `hub-server` at agent.ip:1997
 client: Should get access to all agent ip addresses, shared ports
 
 
@@ -109,7 +109,7 @@ pending: secondary "circle"
 6. Exit process 1s after tests completed (except for host environment)
 
 ## HUBTESTENV=network (only on local mac)
-1. Connect to hub-pro
+1. Connect to hub-server
 2. Check permissions
 3. Join network
 4. Share port
@@ -117,7 +117,7 @@ pending: secondary "circle"
 6. Share invite
 
 ## HUBTESTENV=host (only on local mac)
-1. Connect to hub-pro
+1. Connect to hub-server
 2. Check permissions
 3. Join network
 4. Share port 18403
@@ -128,9 +128,9 @@ pending: secondary "circle"
 ## HUBTESTENV=client (never on local mac)
 1. Use invite link
 2. Join network
-3. Join hub-pro
+3. Join hub-server
 4. Sends requests to 18403 port
 
-`host` and `network` environments always runs on local machine as owner of `hub-pro`. It does all test and shares invites.
-`client` uses invite to join host network and hub-pro through created virtual network
+`host` and `network` environments always runs on local machine as owner of `hub-server`. It does all test and shares invites.
+`client` uses invite to join host network and hub-server through created virtual network
 Before updating testing plan, give me examples how it should be expanded (maybe different environments for different tests or additional tasks per environment)

@@ -49,7 +49,7 @@ import type { AppleLocalAgentBinding } from './local-agent'
 type ChallengeSigner = (challenge: Uint8Array) => Promise<string>
 
 /**
- * Network permission APIs for hub-pro.
+ * Network permission APIs for hub-server.
  *
  * These handle:
  * - Network share registration and attestation validation
@@ -309,7 +309,7 @@ export class NetworkAPI {
    * authenticated by their own service key (the same key they signed the
    * direct bootstrap request with). Unlike the machine path they have no
    * local hub-net agent proof, and unlike apple-app they are not the Hub
-   * owner; hub-pro assigns permanent overlay addresses from the sender
+   * owner; hub-server assigns permanent overlay addresses from the sender
    * context and the wireGuardKey the joiner bound to.
    *
    * A key that was never admitted must present `admission`: the direct

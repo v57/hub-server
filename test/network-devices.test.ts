@@ -40,7 +40,7 @@ describe('Hub Network members by device', () => {
   let security: Security
   let api: NetworkAPI
   beforeEach(async () => {
-    process.chdir(mkdtempSync(join(tmpdir(), 'hub-pro-network-')))
+    process.chdir(mkdtempSync(join(tmpdir(), 'hub-server-network-')))
     security = new Security()
     api = new NetworkAPI(security)
     await api.registry.load()

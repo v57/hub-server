@@ -1,7 +1,10 @@
 {
-  "name": "hub-pro",
+  "name": "hub-server",
   "module": "index.ts",
   "type": "module",
+  "bin": {
+    "hub-server": "index.ts"
+  },
   "scripts": {
     "start": "bun ."
   },

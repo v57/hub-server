@@ -12,7 +12,7 @@ import type { State } from '../src/hub'
 import { certificate, connect, freePort, makeKey, token, until, type Client, type TestKey } from './helpers'
 
 async function inDirectory<T>(files: Record<string, string>, action: () => Promise<T>): Promise<T> {
-  const directory = mkdtempSync(join(tmpdir(), 'hub-pro-grants-'))
+  const directory = mkdtempSync(join(tmpdir(), 'hub-server-grants-'))
   mkdirSync(join(directory, 'data'))
   for (const [name, text] of Object.entries(files)) writeFileSync(join(directory, 'data', name), text)
   const cwd = process.cwd()

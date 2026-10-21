@@ -1,9 +1,10 @@
 <h1>
   <img alt="Containerization logo" src="./icon.png" width="70" valign="middle">
-  &nbsp;Hub Pro Server
+  &nbsp;Hub Server
 </h1>
 
-`hub-pro` is a secure version of [hub-lite](https://github.com/v57/hub-lite). 
+`hub-server` is the Hub server (formerly `hub-pro`; it replaces the retired `hub-lite`).
+- Device identity, deny by default and grants
 - Load balancers
 - Permissions
 - Merge hubs
@@ -13,7 +14,7 @@
 
 #### Run from Bun
 ```sh
-bunx v57/hub-pro
+bunx v57/hub-server
 ```
 #### Run from Source
 ```sh
@@ -21,6 +22,7 @@ bun i && bun .
 ```
 
 ## Options
+- `-h`, `--help`: print the options and exit
 - `-p`, `--port <port>`: listen on a specific port or address
 - `--merge <address>`: will merge api to another Hub.
 - `--owner <id>`: set owner key.

@@ -8,7 +8,7 @@ const owner = 'owner-key'
 const user = 'user-key'
 
 async function securityWith(files: Record<string, string>): Promise<{ security: Security; data: string }> {
-  const directory = mkdtempSync(join(tmpdir(), 'hub-pro-security-'))
+  const directory = mkdtempSync(join(tmpdir(), 'hub-server-security-'))
   const data = join(directory, 'data')
   mkdirSync(data)
   for (const [name, text] of Object.entries(files)) writeFileSync(join(data, name), text)

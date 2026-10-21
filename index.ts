@@ -1,7 +1,19 @@
-import { Hub, security } from './src/hub'
+#!/usr/bin/env bun
+const help = `Usage: hub-server [options]
+
+Options:
+  -p, --port <port>      listen on a port or address (default 1997, env HUBLISTEN)
+  --merge <address>      merge this hub's api into another hub
+  --proxy <address>      join another hub as a proxy
+  --owner <key>          trust this key as an owner (env HUBOWNER)
+  --launcher <key>       let this key host launcher/* (env HUBLAUNCHER)
+  -h, --help             print this help`
+
 let port: number | undefined
 let merges: string[] = []
 let proxies: string[] = []
+let owners: string[] = []
+let launcher = Bun.env['HUBLAUNCHER']
 const argv = process.argv.slice(2)
 while (true) {
   const command = argv.shift()
@@ -21,18 +33,25 @@ while (true) {
       break
     case '--owner':
       const id = argv.shift()
-      if (id) security.addOwner(id)
+      if (id) owners.push(id)
       break
     case '--launcher':
-      security.launcher = argv.shift()
+      launcher = argv.shift()
       break
+    case '-h':
+    case '--help':
+      console.log(help)
+      process.exit(0)
     default:
       break
   }
 }
 const owner = Bun.env['HUBOWNER']
-const launcher = Bun.env['HUBLAUNCHER']
-if (owner?.length) security.addOwner(owner)
+if (owner?.length) owners.push(owner)
+
+// Loads the stores in data/, so it comes after `--help`
+const { Hub, security } = await import('./src/hub')
+owners.forEach(id => security.addOwner(id))
 if (launcher?.length) security.launcher = launcher
 
 const hub = new Hub(port)

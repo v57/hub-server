@@ -3,7 +3,7 @@
   "configVersion": 0,
   "workspaces": {
     "": {
-      "name": "hub-pro",
+      "name": "hub-server",
       "dependencies": {
         "channel": "v57/channel",
       },

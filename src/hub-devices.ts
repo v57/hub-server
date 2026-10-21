@@ -82,10 +82,10 @@ export class HubDevices {
       this.selfId = id
       const now = Math.floor(Date.now() / 1000)
       this.registry.seen(
-        { device: key, deviceId: id, service: hubKey ?? '', instance: 'hub-pro', deviceName: hostName(), platform: hostPlatform(), iat: now, exp: now },
+        { device: key, deviceId: id, service: hubKey ?? '', instance: 'hub-server', deviceName: hostName(), platform: hostPlatform(), iat: now, exp: now },
         true,
       )
-      if (hubKey) this.registry.place({ device: key, deviceId: id, service: hubKey, instance: 'hub-pro', iat: now, exp: now })
+      if (hubKey) this.registry.place({ device: key, deviceId: id, service: hubKey, instance: 'hub-server', iat: now, exp: now })
     } catch (error) {
       console.error('Hub device key unavailable, the hub has no device:', error)
     }

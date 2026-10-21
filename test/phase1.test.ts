@@ -60,7 +60,7 @@ describe('auth token vectors', () => {
 })
 
 describe('security mode migration', () => {
-  const dir = () => mkdtempSync(join(tmpdir(), 'hub-pro-mode-'))
+  const dir = () => mkdtempSync(join(tmpdir(), 'hub-server-mode-'))
   test('a first start is default-deny', async () => {
     const path = join(dir(), 'hub.json')
     const settings = await new HubSettings(path).load()

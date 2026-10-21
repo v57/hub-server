@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Storage } from '../src/settings'
 
-const directory = () => mkdtempSync(join(tmpdir(), 'hub-pro-storage-'))
+const directory = () => mkdtempSync(join(tmpdir(), 'hub-server-storage-'))
 
 function store(path: string) {
   let value: any = { empty: true }

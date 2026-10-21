@@ -110,7 +110,7 @@ describe('devices on the hub', () => {
   test('the hub enrols its own device', async () => {
     const own = await listed(hub.devices.selfId!)
     expect(own).toMatchObject({ approved: true, online: true })
-    expect(own.services[0]).toMatchObject({ key: security.hubKey, instance: 'hub-pro' })
+    expect(own.services[0]).toMatchObject({ key: security.hubKey, instance: 'hub-server' })
   })
 
   test('a new device is pending until approved, then its connections are device connections', async () => {
