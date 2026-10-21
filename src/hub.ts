@@ -428,7 +428,10 @@ export class Hub {
         if (!security.allowsCall(caller, path, service.isPublic)) throw 'permissions required'
         const selected = service.selectFor(context)
         let s = selected ?? service.next()
-        if (!s) s = await service.addPending()
+        if (!s) {
+          s = await service.addPending()
+          if (s) service.claimed(s)
+        }
         if (!s) throw 'api not found'
         if (task?.isCancelled) {
           service.completed(s)
@@ -461,7 +464,10 @@ export class Hub {
         if (!security.allowsCall(caller, path, service.isPublic)) throw 'permissions required'
         const selected = service.selectFor(context)
         let s = selected ?? service.next()
-        if (!s) s = await service.addPending()
+        if (!s) {
+          s = await service.addPending()
+          if (s) service.claimed(s)
+        }
         if (!s) throw 'api not found'
         service.requests += 1
         requests += 1
@@ -581,7 +587,7 @@ export class Hub {
         this.services.set(s, service)
       }
       const enabled = security.allowsHost(state, s)
-      service.add({ sender, state, enabled, sending: new Set(), streams: 0, limit: 0 }, context)
+      service.add({ sender, state, enabled, sending: new Set(), streams: 0, limit: 0, reserved: 0 }, context)
     })
     console.log('+', services.length, 'api')
   }
@@ -635,6 +641,17 @@ export interface Service {
   streams: number
   enabled: boolean
   limit: number
+  /** Handed to waiting calls that haven't started yet; counts against `limit` */
+  reserved: number
+}
+
+/** How long a call waits for a provider of its path before failing with `api not available` */
+export const pendingWait = { timeout: 30_000 }
+
+interface Waiter {
+  resolve(service: Service | undefined): void
+  reject(error: string): void
+  timer: ReturnType<typeof setTimeout>
 }
 
 class Services {
@@ -642,7 +659,8 @@ class Services {
   requests = 0
   services: Service[] = []
   disabled: Service[] = []
-  pending: ((service: Service | undefined) => void)[] = []
+  /** Calls waiting for a provider, oldest first */
+  pending: Waiter[] = []
   /** Connections whose header marked this path `public` */
   publicSenders = new Set<Sender>()
   loadBalancer: LoadBalancer.Type
@@ -657,10 +675,7 @@ class Services {
       if (this.services.findIndex(a => a.sender === service.sender) === -1) {
         this.loadBalancer.add(this.services, service)
         this.enableServiceIfNeeded(context)
-        if (this.pending.length) {
-          const service = this.loadBalancer.next(this.services)
-          this.pending.shift()?.(service)
-        }
+        this.drain()
       }
     } else {
       if (this.disabled.findIndex(a => a.sender === service.sender) === -1) {
@@ -678,6 +693,7 @@ class Services {
     let index = this.services.findIndex(a => a.sender === sender)
     if (index >= 0) {
       this.services[index].limit = limit
+      this.drain()
       return
     }
     index = this.disabled.findIndex(a => a.sender === sender)
@@ -714,6 +730,7 @@ class Services {
     })
     if (!enabled.size) return 0
     this.disabled = this.disabled.filter(a => !enabled.has(a))
+    this.drain()
     return enabled.size
   }
   revokeKey(key: string, context: ServiceUpdateContext): number {
@@ -757,24 +774,62 @@ class Services {
     if (!this.isEnabled || this.services.length) return
     this.isEnabled = false
     context.remove(this.name)
-    if (this.pending.length) {
-      this.pending.forEach(a => a(undefined))
-      this.pending = []
+    const pending = this.pending
+    this.pending = []
+    for (const waiter of pending) {
+      clearTimeout(waiter.timer)
+      waiter.resolve(undefined)
     }
   }
   private _next(): Service | undefined {
     return this.loadBalancer.next(this.services)
   }
+  /** A provider for a new call. Older waiting calls are served first; a provider left over goes to this one. */
   next(): Service | undefined {
+    this.drain()
     if (this.pending.length > 0) return
     return this._next()
   }
+  /**
+   * Waits for a provider; `next()` had none. Fails with `api not available` after `pendingWait.timeout` or when
+   * `pendingLimit` newer calls push it out. The caller passes the provider it gets to `claimed`.
+   */
   addPending(): Promise<Service | undefined> {
-    if (settings.data.pendingLimit > 0) {
-      const deleteCount = this.pending.length + 1 - settings.data.pendingLimit
-      if (deleteCount > 0) this.pending.splice(0, deleteCount)
+    return new Promise((resolve, reject) => {
+      const waiter: Waiter = {
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          const index = this.pending.indexOf(waiter)
+          if (index === -1) return
+          this.pending.splice(index, 1)
+          reject('api not available')
+        }, pendingWait.timeout),
+      }
+      this.pending.push(waiter)
+      if (settings.data.pendingLimit > 0) {
+        const evicted = this.pending.splice(0, Math.max(0, this.pending.length - settings.data.pendingLimit))
+        for (const old of evicted) {
+          clearTimeout(old.timer)
+          old.reject('api not available')
+        }
+      }
+    })
+  }
+  /** Hands free providers to waiting calls, oldest first, reserving each until its call starts */
+  private drain() {
+    while (this.pending.length) {
+      const service = this._next()
+      if (!service) return
+      const waiter = this.pending.shift()!
+      clearTimeout(waiter.timer)
+      service.reserved += 1
+      waiter.resolve(service)
     }
-    return new Promise(success => this.pending.push(service => success(service)))
+  }
+  /** A waiting call got `service` and starts now */
+  claimed(service: Service) {
+    if (service.reserved > 0) service.reserved -= 1
   }
   get status(): ServicesStatus {
     return {
@@ -829,10 +884,11 @@ class Services {
       this.loadBalancer = loadBalancer
     }
   }
+  /** A call on `service` ended, so it may take a waiting one */
   completed(service: Service) {
-    if (this.pending.length === 0) return
-    this.pending.shift()?.(service)
+    this.drain()
   }
+
 }
 
 class Apps {
