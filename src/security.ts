@@ -111,8 +111,8 @@ const publicBuiltins = new Set([
   'hub/header',
 ])
 // `hub/net/bind` keeps the proof of its bind kind, `hub/net/node` tells agents where their node is, `hub/pair` makes
-// the holder of the pairing code an owner
-const authBuiltins = new Set(['hub/api/services', 'hub/net/bind', 'hub/net/node', 'hub/pair'])
+// the holder of the pairing code an owner, `hub/grant/check` limits services to their own paths
+const authBuiltins = new Set(['hub/api/services', 'hub/net/bind', 'hub/net/node', 'hub/pair', 'hub/grant/check'])
 const reporterBuiltins = new Set(['hub/device/describe', 'hub/device/data'])
 const grantBuiltins = new Set(['hub/devices', 'hub/devices/data'])
 
@@ -140,6 +140,30 @@ export interface Caller {
 }
 
 export const ownersGroup = 'owners'
+
+/**
+ * A hub error with a code (channel wire v2, protocol.md section 11). The message stays the string older clients
+ * compare; `code` is for new ones.
+ */
+export class HubError extends Error {
+  constructor(
+    message: string,
+    readonly code: string,
+  ) {
+    super(message)
+  }
+  override toString() {
+    return this.message
+  }
+  /** No key (anonymous caller) where one is needed */
+  static unauthorized = () => new HubError('unauthorized', 'unauthorized')
+  /** The caller may not call this path */
+  static forbidden = () => new HubError('permissions required', 'forbidden')
+  /** No provider registered the path */
+  static notFound = () => new HubError('api not found', 'not_found')
+  /** The path has providers, but none took the call in time */
+  static unavailable = () => new HubError('api not available', 'unavailable')
+}
 
 /** A connection's identity: its key and, when device-attached, its device id */
 export interface Principal {
@@ -393,15 +417,15 @@ export class Security implements SecurityInterface {
       case 'reporter':
         return
       case 'auth':
-        if (!caller.key) throw 'unauthorized'
+        if (!caller.key) throw HubError.unauthorized()
         return
       case 'grant':
         // Approved devices are members and read the directory of their hub; others need a grant
         if (caller.owner || (!this.lockdown && (caller.device || this.granted(caller, path)))) return
-        throw 'permissions required'
+        throw HubError.forbidden()
       case 'owner':
         if (caller.owner) return
-        throw 'permissions required'
+        throw HubError.forbidden()
     }
   }
   allowsBuiltin(caller: Caller, path: string): boolean {

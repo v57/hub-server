@@ -6,7 +6,7 @@ import { settings } from './settings.ts'
 import { publicKey } from './keychain.ts'
 import * as LoadBalancer from './load balancers.ts'
 import type { Cancellable } from 'channel/channel'
-import { Security, builtinAccess, deviceMember, keyMember, ownersGroup, type Caller, type Principal } from './security.ts'
+import { HubError, Security, builtinAccess, deviceMember, keyMember, ownersGroup, type Caller, type Principal } from './security.ts'
 import { randomUUIDv7, type Server } from 'bun'
 import {
   appleAgentAPIsEnabled,
@@ -54,6 +54,8 @@ export interface State {
   instance?: string
   /** A valid certificate, also from a pending device */
   certificate?: Certificate
+  /** Its paths take no new calls (`hub/service/update { draining: true }`); running calls go on */
+  draining?: boolean
 }
 
 interface ServiceProvider {
@@ -219,7 +221,7 @@ export class Hub {
       .stream('hub/api/services', ({ body, state: { key, device } }) => {
         return this.serviceProviders.makeIterator(JSON.stringify([key, device, body]))
       })
-      .post('hub/service/update', ({ body: { add, remove, addApps, removeApps, services, apps, reporter }, state, sender }) => {
+      .post('hub/service/update', ({ body: { add, remove, addApps, removeApps, services, apps, reporter, draining }, state, sender }) => {
         if (reporter === true) this.devices.requestReporter(state)
         const context = this.merger.context()
         if (services && Array.isArray(services)) {
@@ -254,6 +256,7 @@ export class Hub {
         if (remove && Array.isArray(remove)) this.removeServices(sender, state, remove, context)
         if (addApps && Array.isArray(addApps)) this.apps.add(sender, state, addApps)
         if (removeApps && Array.isArray(removeApps)) this.apps.remove(sender, state, removeApps)
+        if (typeof draining === 'boolean') this.setDraining(sender, state, draining, context)
         context.applyChanges()
         sendUpdates()
         this.devices.devicesState.setNeedsUpdate()
@@ -397,6 +400,7 @@ export class Hub {
       .stream('hub/groups', () => security.group.infoSubscription.makeIterator())
       .stream('hub/grants', () => security.grants.subscription.makeIterator())
       .post('hub/grant/add', ({ body, state }) => security.addGrant(body, state))
+      .post('hub/grant/check', ({ body, state, sender }) => this.checkGrant(body, state, sender))
       .post('hub/grant/remove', ({ body }) => {
         if (!security.grants.remove(body?.id)) throw 'grant not found'
       })
@@ -423,16 +427,16 @@ export class Hub {
       .stream('hub/status/badges', () => statusBadges.makeIterator())
       .postOther(other, async ({ body, path, context, task, state, sender }) => {
         const service = this.services.get(path)
-        if (!service) throw 'api not found'
+        if (!service) throw HubError.notFound()
         const caller = this.caller(state, sender, context)
-        if (!security.allowsCall(caller, path, service.isPublic)) throw 'permissions required'
+        if (!security.allowsCall(caller, path, service.isPublic)) throw HubError.forbidden()
         const selected = service.selectFor(context)
         let s = selected ?? service.next()
         if (!s) {
           s = await service.addPending()
           if (s) service.claimed(s)
         }
-        if (!s) throw 'api not found'
+        if (!s) throw HubError.notFound()
         if (task?.isCancelled) {
           service.completed(s)
           throw 'cancelled'
@@ -459,16 +463,16 @@ export class Hub {
       })
       .streamOther(other, async function* ({ body, path, context, state, sender }) {
         const service = services.get(path)
-        if (!service) throw 'api not found'
+        if (!service) throw HubError.notFound()
         const caller = hub.caller(state, sender, context)
-        if (!security.allowsCall(caller, path, service.isPublic)) throw 'permissions required'
+        if (!security.allowsCall(caller, path, service.isPublic)) throw HubError.forbidden()
         const selected = service.selectFor(context)
         let s = selected ?? service.next()
         if (!s) {
           s = await service.addPending()
           if (s) service.claimed(s)
         }
-        if (!s) throw 'api not found'
+        if (!s) throw HubError.notFound()
         service.requests += 1
         requests += 1
         s.streams += 1
@@ -587,9 +591,38 @@ export class Hub {
         this.services.set(s, service)
       }
       const enabled = security.allowsHost(state, s)
-      service.add({ sender, state, enabled, sending: new Set(), streams: 0, limit: 0, reserved: 0 }, context)
+      service.add({ sender, state, enabled, sending: new Set(), streams: 0, limit: 0, reserved: 0, draining: state.draining === true }, context)
     })
     console.log('+', services.length, 'api')
+  }
+  /**
+   * `hub/service/update { draining }`: while draining, the connection's paths take no new calls and its running calls
+   * go on. A path whose last provider drains leaves `hub/api`; calls to it wait for another provider (`pendingWait`).
+   */
+  setDraining(sender: Sender, state: State, draining: boolean, context: ServiceUpdateContext) {
+    state.draining = draining
+    state.services.forEach(path => this.services.get(path)?.setDraining(sender, draining, context))
+  }
+  /**
+   * `hub/grant/check { path, caller }` → `{ allowed }`: whether `path` is granted to `caller` (a request's
+   * `context.hub.caller`, or `{ key?, device? }`), for permissions a service checks itself. Owners always are; grants
+   * count unless the hub is locked down. Services ask about paths under the first segment of a path they registered,
+   * owners about any path.
+   */
+  checkGrant(body: any, state: State, sender: Sender): { allowed: boolean } {
+    const path = body?.path
+    if (typeof path !== 'string' || !path) throw new HubError('invalid path', 'invalid_input')
+    if (!this.caller(state, sender).owner) {
+      const scope = path.split('/')[0]
+      if (!Array.from(state.services).some(registered => registered.split('/')[0] === scope)) throw HubError.forbidden()
+    }
+    const subject = body?.caller
+    const key = typeof subject?.key === 'string' ? subject.key : undefined
+    const device = typeof subject?.device === 'string' ? subject.device : typeof subject?.device?.id === 'string' ? subject.device.id : undefined
+    let caller = security.caller({ key, device })
+    // A caller through a merged hub is never an owner here, as when its call was forwarded
+    if (subject?.via !== undefined) caller = { ...caller, groups: caller.groups.filter(group => group !== ownersGroup), owner: false }
+    return { allowed: caller.owner || (!security.lockdown && security.granted(caller, path)) }
   }
   removeServices(sender: Sender, state: State, services: string[], context: ServiceUpdateContext) {
     services.forEach(s => {
@@ -643,6 +676,8 @@ export interface Service {
   limit: number
   /** Handed to waiting calls that haven't started yet; counts against `limit` */
   reserved: number
+  /** Takes no new calls, see `Hub.setDraining` */
+  draining: boolean
 }
 
 /** How long a call waits for a provider of its path before failing with `api not available` */
@@ -650,7 +685,7 @@ export const pendingWait = { timeout: 30_000 }
 
 interface Waiter {
   resolve(service: Service | undefined): void
-  reject(error: string): void
+  reject(error: HubError): void
   timer: ReturnType<typeof setTimeout>
 }
 
@@ -659,6 +694,8 @@ class Services {
   requests = 0
   services: Service[] = []
   disabled: Service[] = []
+  /** Enabled providers that take no new calls; their running calls go on */
+  draining: Service[] = []
   /** Calls waiting for a provider, oldest first */
   pending: Waiter[] = []
   /** Connections whose header marked this path `public` */
@@ -671,7 +708,9 @@ class Services {
     this.loadBalancer = new LoadBalancer.Counter()
   }
   add(service: Service, context: ServiceUpdateContext) {
-    if (service.enabled) {
+    if (service.enabled && service.draining) {
+      if (!this.draining.some(a => a.sender === service.sender)) this.draining.push(service)
+    } else if (service.enabled) {
       if (this.services.findIndex(a => a.sender === service.sender) === -1) {
         this.loadBalancer.add(this.services, service)
         this.enableServiceIfNeeded(context)
@@ -696,10 +735,34 @@ class Services {
       this.drain()
       return
     }
-    index = this.disabled.findIndex(a => a.sender === sender)
-    if (index >= 0) {
-      this.disabled[index].limit = limit
+    const other = this.disabled.find(a => a.sender === sender) ?? this.draining.find(a => a.sender === sender)
+    if (other) other.limit = limit
+  }
+  /** Moves an enabled provider out of or back into load balancing, keeping its running calls */
+  setDraining(sender: Sender, draining: boolean, context: ServiceUpdateContext) {
+    const disabled = this.disabled.find(a => a.sender === sender)
+    if (disabled) {
+      disabled.draining = draining
       return
+    }
+    if (draining) {
+      const service = this.loadBalancer.remove(this.services, sender)
+      if (!service) return
+      service.draining = true
+      this.draining.push(service)
+      // Waiting calls keep waiting for another provider
+      if (this.isEnabled && !this.services.length) {
+        this.isEnabled = false
+        context.remove(this.name)
+      }
+    } else {
+      const index = this.draining.findIndex(a => a.sender === sender)
+      if (index === -1) return
+      const [service] = this.draining.splice(index, 1)
+      service.draining = false
+      this.loadBalancer.add(this.services, service)
+      this.enableServiceIfNeeded(context)
+      this.drain()
     }
   }
   select(id: string, device?: string): Service | undefined {
@@ -716,7 +779,7 @@ class Services {
     const selected = typeof context?.service === 'string' ? this.select(context.service, device) : undefined
     if (selected || !device) return selected
     const onDevice = this.services.filter(service => service.state.device === device)
-    if (!onDevice.length) throw 'api not found'
+    if (!onDevice.length) throw HubError.notFound()
     return onDevice.reduce((a, b) => (b.sending.size + b.streams < a.sending.size + a.streams ? b : a))
   }
   allowKey(key: string, context: ServiceUpdateContext): number {
@@ -725,6 +788,7 @@ class Services {
       if (s.state.key !== key) return
       enabled.add(s)
       s.enabled = true
+      if (s.draining) return void this.draining.push(s)
       this.loadBalancer.add(this.services, s)
       this.enableServiceIfNeeded(context)
     })
@@ -745,6 +809,13 @@ class Services {
     for (const service of disabled) {
       this.loadBalancer.remove(this.services, service.sender)?.sending.forEach(a => a.cancel())
     }
+    for (const service of this.draining.filter(s => s.state.key === key)) {
+      this.draining.splice(this.draining.indexOf(service), 1)
+      service.enabled = false
+      this.disabled.push(service)
+      disabled.push(service)
+      service.sending.forEach(a => a.cancel())
+    }
     this.disableServiceIfNeeded(context)
     return disabled.length
   }
@@ -754,11 +825,12 @@ class Services {
   }
   /** Callable by anyone in `default-deny`: an enabled provider marked the path public */
   get isPublic(): boolean {
-    return this.services.some(service => this.publicSenders.has(service.sender))
+    return [this.services, this.draining].some(list => list.some(service => this.publicSenders.has(service.sender)))
   }
   remove(sender: Sender, context: ServiceUpdateContext) {
     this.publicSenders.delete(sender)
-    const s = this.loadBalancer.remove(this.services, sender)
+    const drainingIndex = this.draining.findIndex(a => a.sender === sender)
+    const s = this.loadBalancer.remove(this.services, sender) ?? (drainingIndex >= 0 ? this.draining.splice(drainingIndex, 1)[0] : undefined)
     s?.sending.forEach(a => a.cancel())
     this.disableServiceIfNeeded(context)
     const index = this.disabled.findIndex(a => a.sender === sender)
@@ -803,7 +875,7 @@ class Services {
           const index = this.pending.indexOf(waiter)
           if (index === -1) return
           this.pending.splice(index, 1)
-          reject('api not available')
+          reject(HubError.unavailable())
         }, pendingWait.timeout),
       }
       this.pending.push(waiter)
@@ -811,7 +883,7 @@ class Services {
         const evicted = this.pending.splice(0, Math.max(0, this.pending.length - settings.data.pendingLimit))
         for (const old of evicted) {
           clearTimeout(old.timer)
-          old.reject('api not available')
+          old.reject(HubError.unavailable())
         }
       }
     })
@@ -839,7 +911,8 @@ class Services {
       requests: this.requests,
       balancer: this.loadBalancer.name,
       pending: this.pending.length,
-      running: this.services.reduce((a, b) => a + b.sending.size + b.streams, 0),
+      running: [...this.services, ...this.draining].reduce((a, b) => a + b.sending.size + b.streams, 0),
+      ...(this.draining.length ? { draining: this.draining.length } : {}),
     }
   }
   providers(security: Security): ServiceProvider[] {
@@ -972,6 +1045,8 @@ interface ServicesStatus {
   balancer: LoadBalancer.Name
   pending: number
   running: number
+  /** Providers that take no new calls */
+  draining?: number
 }
 interface StatusBadges {
   services: number

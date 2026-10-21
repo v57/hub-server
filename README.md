@@ -56,7 +56,8 @@ this is written to `data/`, so the same hub started normally keeps its stored mo
 
 ## Conformance harness
 `test/conformance/e2e-hub.ts` checks a Hub server over the raw protocol (`Docs/Devices/protocol.md`): hub key and v1
-auth, devices, caller identity, default deny, grants, groups, reporter, selection, revocation and pairing. It starts
+auth, devices, caller identity, default deny, grants, groups, reporter, selection, error codes, `hub/grant/check`,
+draining, revocation and pairing. It starts
 the server twice in fresh temp directories, as `<command> --port <port> --owner <SPKI>` and without `--owner` (then it
 reads `Pairing code: XXX-XXX` from stdout or `data/pairing-code`, then runs `<command> --pair` next to the running
 server), and exits non-zero if a check fails.
@@ -81,6 +82,19 @@ HUB_SERVER_CMD='swift run --package-path ../HubServer hub-server-swift' bun run 
 - Services can provide permission for each api, so only allowed connections can use it
 - Owners can create permission groups and assign keys to it
 - Lockdown mode blocks any non whitelisted users to connect to Hub
+
+- Services check permissions of their own with `hub/grant/check { path, caller }` → `{ allowed }`: true for owners
+  and for callers an owner granted the path (a `path` or `prefix` grant to their key, device, group or everyone).
+  A service asks only about paths under the first segment of a path it registered (`posts/moderate` for a service
+  of `posts/*`); owners ask about any path.
+
+## Draining and errors
+- `hub/service/update { draining: true }` stops a connection's paths from taking new calls while its running calls
+  finish (graceful shutdown, or not ready); `draining: false` undoes it. A path whose last provider drains leaves
+  `hub/api`, and calls to it wait for another provider for up to 30 s, so a restarted service picks them up.
+- Errors keep their v1 messages and carry a code (channel wire v2): `unauthorized`, `forbidden` (`permissions
+  required`), `not_found` (`api not found`), `unavailable` (`api not available`). A service's own error passes through
+  with its `code` and `info`.
 
 ## Create hub service
 [TypeScript](https://github.com/v57/hub-service) [Swift](https://github.com/v57/HubService)

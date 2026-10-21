@@ -203,6 +203,62 @@ try {
     assert(refused, 'unknown device selection should fail')
   })
 
+  // 4b. service features: error codes, hub/grant/check, draining (protocol.md sections 5, 6 and 11)
+  const rejection = (promise: Promise<unknown>) =>
+    promise.then(() => 'ok', (e: any) => `${e?.message ?? e}|${e?.code ?? ''}`)
+  await check('call errors carry codes', async () => {
+    const nobody = connect(() => auth(newKey(), hubKey))
+    const refused = await rejection(nobody.send('e2e/whoami'))
+    assert(refused === 'permissions required|forbidden', `stranger call → ${refused}`)
+    const missing = await rejection(ownerC.send('e2e/missing'))
+    assert(missing === 'api not found|not_found', `missing path → ${missing}`)
+    nobody.ws?.close?.()
+  })
+  await check('hub/grant/check answers for paths under the service\'s own', async () => {
+    const ask = (path: string) => svc.send('hub/grant/check', { path, caller: { key: stranger.pub } })
+    const before: any = await ask('e2e/moderate')
+    assert(before?.allowed === false, `before grant ${JSON.stringify(before)}`)
+    const grant: any = await ownerC.send('hub/grant/add', { subject: { key: stranger.pub }, object: { path: 'e2e/moderate' } })
+    const after: any = await ask('e2e/moderate')
+    assert(after?.allowed === true, `after grant ${JSON.stringify(after)}`)
+    await ownerC.send('hub/grant/remove', { id: grant.id })
+    const owned: any = await svc.send('hub/grant/check', { path: 'e2e/anything', caller: { key: owner.pub } })
+    assert(owned?.allowed === true, `owner ${JSON.stringify(owned)}`)
+    const outside = await rejection(ask('billing/refund'))
+    assert(outside === 'permissions required|forbidden', `outside its paths → ${outside}`)
+  })
+  await check('a draining provider finishes running calls and takes no new ones', async () => {
+    const provider = (key: Key, answer: (release: Promise<void>) => Promise<string>, release: Promise<void>) => {
+      const channel = new Channel<any>()
+      channel.post('e2e/drain', () => answer(release))
+      return channel.connect(address, {
+        headers: () => auth(key, hubKey),
+        async onConnect(s) { await s.send('hub/service/update', { services: [{ path: 'e2e/drain' }] }) },
+      })
+    }
+    const firstKey = newKey(), secondKey = newKey()
+    let release!: () => void
+    const released = new Promise<void>(r => (release = r))
+    const first = provider(firstKey, async gate => (await gate, 'first'), released)
+    await wait(300)
+    await ownerC.send('hub/host/update', { key: firstKey.pub, allow: ['e2e/drain'] })
+    await wait(300)
+    const running = ownerC.send('e2e/drain')
+    await wait(300)
+    await first.send('hub/service/update', { draining: true })
+    const waiting = ownerC.send('e2e/drain')
+    const second = provider(secondKey, async () => 'second', released)
+    await wait(300)
+    await ownerC.send('hub/host/update', { key: secondKey.pub, allow: ['e2e/drain'] })
+    const next = await Promise.race([waiting, wait(4000).then(() => 'timeout')])
+    assert(next === 'second', `call after draining → ${next}`)
+    release()
+    const done = await Promise.race([running, wait(4000).then(() => 'timeout')])
+    assert(done === 'first', `running call → ${done}`)
+    first.ws?.close?.()
+    second.ws?.close?.()
+  })
+
   // 5. revoke
   await check('revoke closes the service and refuses its key', async () => {
     await ownerC.send('hub/device/revoke', { id: deviceId(devKey) })
