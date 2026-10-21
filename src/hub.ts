@@ -188,10 +188,10 @@ export class Hub {
         this.addPairedOwner(state)
         return { owner: true, hubKey: security.hubKey, name: (await this.header.load()).name }
       })
-      .post('hub/pair/new', async ({ state, sender }) => {
+      .post('hub/pair/new', async ({ sender }) => {
+        // Owner-only as a built-in; a merged hub's caller is never one
+        if (this.merger.connectionFor(sender)) throw 'permissions required'
         if (this.local) throw 'no pairing in local mode'
-        const launcher = !!security.launcher && state.key === security.launcher
-        if (this.merger.connectionFor(sender) || !(launcher || security.isOwner(state))) throw 'permissions required'
         const code = await this.pairing.create()
         console.log(`Pairing code: ${code}`)
         return { code, expires: this.pairing.expires }
@@ -526,11 +526,11 @@ export class Hub {
   stats() {
     this.services.map(a => a)
   }
-  /** At start: a pairing code when the hub has no owners or `force` (`--pair`), see `Pairing.start`. None in local mode. */
-  async startPairing(force = false): Promise<string | undefined> {
+  /** At start: a pairing code when the hub has no owners, see `Pairing.start`. None in local mode. */
+  async startPairing(): Promise<string | undefined> {
     await this.ready
     if (this.local) return
-    return this.pairing.start({ needed: security.members.members(ownersGroup).size === 0, force })
+    return this.pairing.start({ needed: security.members.members(ownersGroup).size === 0 })
   }
   /** `hub/pair` succeeded: the key and, with a certificate, its device (approved) join the owners */
   private addPairedOwner(state: State) {

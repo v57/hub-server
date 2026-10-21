@@ -9,7 +9,8 @@ Options:
   --launcher <key>       let this key host launcher/* (env HUBLAUNCHER)
   --local                local mode: 127.0.0.1 only, default-allow, the launcher key is an owner, no pairing
                          (env HUB_MODE=local)
-  --pair                 print a new pairing code, replacing the old one (a hub without owners makes one anyway)
+  --pair                 write a new pairing code to data/, replacing the old one, print it and exit; a running
+                         hub on that data/ takes it at once (a hub without owners makes one at start anyway)
   -h, --help             print this help`
 
 let port: number | undefined
@@ -60,13 +61,20 @@ while (true) {
 const owner = Bun.env['HUBOWNER']
 if (owner?.length) owners.push(owner)
 
+// One-shot, also while a hub runs on this data/: it re-reads data/pairing.json on every attempt
+if (pair) {
+  const { Pairing } = await import('./src/pairing')
+  await new Pairing().start({ needed: true, force: true })
+  process.exit(0)
+}
+
 // Loads the stores in data/, so it comes after `--help`
 const { Hub, security } = await import('./src/hub')
 owners.forEach(id => security.addOwner(id))
 if (launcher?.length) security.launcher = launcher
 
 const hub = new Hub(port, { local })
-hub.startPairing(pair).catch(error => console.error('Pairing code unavailable:', error))
+hub.startPairing().catch(error => console.error('Pairing code unavailable:', error))
 merges.forEach(address => {
   hub.merger.connect(address, hub, false)
 })

@@ -4,7 +4,8 @@
 //
 // The command is run through sh in a fresh empty working directory, with HUB_DEVICE_KEY pointing into it, as
 // `<command> --port <port> [--owner <SPKI>]`. Without --owner it must print `Pairing code: XXX-XXX` to stdout (or
-// write the code to data/pairing-code), per protocol.md section 12.
+// write the code to data/pairing-code), per protocol.md section 12. `<command> --pair` in the same directory must print
+// a new code and exit while the server runs, and the server must take that code at once.
 import { Channel } from 'channel/client'
 import { createHash, createPrivateKey, generateKeyPairSync, sign } from 'node:crypto'
 import { mkdtempSync } from 'node:fs'
@@ -254,6 +255,24 @@ try {
     const start = Date.now()
     await Promise.all([1, 2, 3].map(() => failure(pairerC.send('hub/pair', { code: wrong(code) }))))
     assert(Date.now() - start >= 3000, `3 attempts in ${Date.now() - start} ms`)
+  })
+  await check('the one-shot --pair replaces the code for the running hub and exits', async () => {
+    const proc = Bun.spawn(['sh', '-c', `exec ${HUB_SERVER_CMD} "$@"`, 'hub-server', '--pair'], {
+      cwd: pairingHub!.dir,
+      env: { ...process.env, HUB_DEVICE_KEY: join(pairingHub!.dir, 'device.key'), HUBLISTEN: '', HUBOWNER: '', HUB_MODE: '' },
+      stdout: 'pipe',
+      stderr: 'inherit',
+    })
+    const exited = await Promise.race([proc.exited, wait(START_TIMEOUT).then(() => 'timeout')])
+    if (exited === 'timeout') proc.kill()
+    assert(exited === 0, `--pair exited with ${exited}`)
+    const printed = (await new Response(proc.stdout).text()).match(/Pairing code: ([0-9A-Z]{3}-[0-9A-Z]{3})/)?.[1]
+    assert(printed, 'no pairing code printed')
+    if (printed !== code) {
+      const old = await failure(pairerC.send('hub/pair', { code }))
+      assert(old.includes('invalid pairing code'), `old code: ${old}`)
+    }
+    code = printed!
   })
   await check('the code makes the caller an owner and approves its device', async () => {
     const result = await pairerC.send('hub/pair', { code: code.toLowerCase().replace('-', ' ') })

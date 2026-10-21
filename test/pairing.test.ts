@@ -14,10 +14,11 @@ import {
   pairingMaxAttempts,
 } from '../src/pairing'
 import { deviceMember, keyMember, ownersGroup } from '../src/security'
-import { certificate, connect, freePort, makeKey, token, type Client, type TestKey } from './helpers'
+import { certificate, connect, freePort, makeKey, token, waitFor, type Client, type TestKey } from './helpers'
 
 const directory = () => mkdtempSync(join(tmpdir(), 'hub-server-pairing-'))
-const fast = () => new Pairing(directory(), { minDuration: 0 })
+const fast_ = (dir: string) => new Pairing(dir, { minDuration: 0 })
+const fast = () => fast_(directory())
 const mode = (path: string) => statSync(path).mode & 0o777
 const exists = (path: string) => Bun.file(path).exists()
 const now = () => Math.floor(Date.now() / 1000)
@@ -101,8 +102,9 @@ describe('pairing store', () => {
     const pairing = fast()
     const code = await pairing.create()
     const stored = await Bun.file(pairing.path).json()
-    ;(pairing as any).state.expires = now() - 1
+    await Bun.write(pairing.path, JSON.stringify({ ...stored, expires: now() - 1 }))
     expect(await failure(pairing.verify(code))).toBe('no pairing code')
+    expect(await exists(pairing.path)).toBe(false)
     expect(await exists(pairing.codePath)).toBe(false)
     // Expired on disk: removed at load
     const other = fast()
@@ -117,11 +119,38 @@ describe('pairing store', () => {
   test('the expiry timer deletes the plain code', async () => {
     const pairing = fast()
     await pairing.create()
-    ;(pairing as any).state.expires = now()
-    ;(pairing as any).scheduleExpiry()
-    await Bun.sleep(20)
-    expect(await exists(pairing.codePath)).toBe(false)
-    expect(pairing.active).toBe(false)
+    const stored = await Bun.file(pairing.path).json()
+    await Bun.write(pairing.path, JSON.stringify({ ...stored, expires: now() + 1 }))
+    await pairing.load()
+    expect(pairing.active).toBe(true)
+    await waitFor(async () => !(await exists(pairing.codePath)), 3000)
+    expect(await exists(pairing.path)).toBe(false)
+  }, 5000)
+
+  test('the expiry timer keeps a code another process made meanwhile', async () => {
+    const pairing = fast()
+    await pairing.create()
+    const stored = await Bun.file(pairing.path).json()
+    await Bun.write(pairing.path, JSON.stringify({ ...stored, expires: now() + 1 }))
+    await pairing.load()
+    const code = await fast_(pairing.directory).create()
+    await Bun.sleep(2100)
+    expect(await Bun.file(pairing.codePath).text()).toBe(code)
+    await pairing.verify(code)
+  }, 5000)
+
+  test('a code made by another process works at once and shares its attempts', async () => {
+    const server = await fast().load()
+    const oneShot = fast_(server.directory)
+    const code = await oneShot.create()
+    expect(await failure(server.verify(wrong(code)))).toBe('invalid pairing code')
+    expect((await Bun.file(server.path).json()).attempts).toBe(1)
+    // A newer code replaces it for the running hub too
+    let newer = await oneShot.create()
+    while (newer === code) newer = await oneShot.create()
+    expect(await failure(server.verify(code))).toBe('invalid pairing code')
+    await server.verify(newer)
+    expect(await exists(server.codePath)).toBe(false)
   })
 
   test('a new code replaces the old one', async () => {
@@ -209,7 +238,7 @@ describe('pairing on the hub', () => {
   })
   afterAll(() => clients.forEach(c => c.sender.stop()))
 
-  test('a hub without owners makes a code at start, one with owners only with --pair', async () => {
+  test('a hub without owners makes a code at start, one with owners does not', async () => {
     for (const member of Array.from(security.members.members(ownersGroup))) security.members.remove(ownersGroup, member)
     await hub.pairing.clear()
     const code = await hub.startPairing()
@@ -218,8 +247,24 @@ describe('pairing on the hub', () => {
     security.members.add(ownersGroup, keyMember(makeKey().key))
     await hub.pairing.clear()
     expect(await hub.startPairing()).toBeUndefined()
-    expect(await hub.startPairing(true)).toBeDefined()
   })
+
+  test('hub-server --pair writes a code the running hub takes at once, and exits', async () => {
+    await hub.pairing.clear()
+    const proc = Bun.spawn(['bun', join(import.meta.dir, '..', 'index.ts'), '--pair'], {
+      cwd: process.cwd(),
+      env: { ...process.env, HUBOWNER: '', HUB_MODE: '' },
+      stdout: 'pipe',
+    })
+    expect(await proc.exited).toBe(0)
+    const printed = (await new Response(proc.stdout).text()).match(/Pairing code: ([0-9A-Z]{3}-[0-9A-Z]{3})/)?.[1]
+    expect(printed).toBeDefined()
+    expect(await Bun.file('data/pairing-code').text()).toBe(printed!)
+    expect(mode('data/pairing.json')).toBe(0o600)
+    const key = makeKey()
+    expect(await client(key).sender.send('hub/pair', { code: printed })).toMatchObject({ owner: true })
+    expect(security.isOwner(key.key)).toBe(true)
+  }, 10_000)
 
   test('anonymous callers cannot pair', async () => {
     const code = await hub.pairing.create()
@@ -252,21 +297,21 @@ describe('pairing on the hub', () => {
     expect(security.isOwner(key.key)).toBe(true)
   })
 
-  test('hub/pair/new is for owners and the launcher', async () => {
-    const stranger = client(makeKey())
+  test('hub/pair/new is for owners only, not the launcher key', async () => {
+    const strangerKey = makeKey()
+    const stranger = client(strangerKey)
     expect(await failure(stranger.sender.send('hub/pair/new'))).toContain('permissions required')
     const launcher = makeKey()
     security.launcher = launcher.key
-    const result = await client(launcher).sender.send('hub/pair/new')
+    expect(await failure(client(launcher).sender.send('hub/pair/new'))).toContain('permissions required')
+    security.launcher = undefined
+    const owner = makeKey()
+    security.addOwner(owner.key)
+    const result = await client(owner).sender.send('hub/pair/new')
     expect(result.code).toMatch(/^[0-9A-Z]{3}-[0-9A-Z]{3}$/)
     expect(result.expires).toBe(hub.pairing.expires)
     expect(await Bun.file('data/pairing-code').text()).toBe(result.code)
-    const owner = makeKey()
-    security.addOwner(owner.key)
-    const replaced = await client(owner).sender.send('hub/pair/new')
-    expect(await failure(stranger.sender.send('hub/pair', { code: result.code }))).toContain(
-      replaced.code === result.code ? 'ok' : 'invalid pairing code',
-    )
-    security.launcher = undefined
+    await stranger.sender.send('hub/pair', { code: result.code })
+    expect(security.isOwner(strangerKey.key)).toBe(true)
   })
 })

@@ -27,7 +27,7 @@ bun i && bun .
 - `--merge <address>`: will merge api to another Hub.
 - `--owner <id>`: set owner key.
 - `--launcher <id>`: sets launcher key that allowed to host `launcher/*` APIs.
-- `--pair`: print a new pairing code, replacing the old one.
+- `--pair`: write a new pairing code, replacing the old one, print it and exit.
 - `--local`: local mode, see below.
 ## Environment
 - `HUBLISTEN`: default listen address or port.
@@ -41,11 +41,13 @@ The first client to send it becomes an owner:
 - `hub/pair` (post, any keyed caller) `{ code }` → `{ owner: true, hubKey, name }`. Adds the caller's key to `owners`
   and, when the connection has a device certificate, approves that device and adds it too. Case, spaces and `-` are
   ignored. Errors: `invalid pairing code`, `no pairing code`.
-- `hub/pair/new` (post, owners and the launcher key) → `{ code, expires }`: a new code replacing the old one.
+- `hub/pair/new` (post, owners) → `{ code, expires }`: a new code replacing the old one.
 
-A code is 6 symbols of Crockford base32, valid for one hour and one success. Every check takes at least 1 s and checks
-run one at a time, and 10 wrong codes invalidate the code. Only its scrypt hash is stored (`data/pairing.json`). A
-still-valid code survives restarts; `--pair` replaces it.
+`hub-server --pair` is a one-shot: it writes a new code to `data/`, prints it and exits, also while a hub runs on the
+same `data/`. The running hub re-reads `data/pairing.json` on every attempt, so the new code works at once. A code is 6
+symbols of Crockford base32, valid for one hour and one success. Every check takes at least 1 s and checks run one at a
+time, and 10 wrong codes invalidate the code. Only its scrypt hash is stored (`data/pairing.json`, which also counts
+the wrong codes). A still-valid code survives restarts.
 
 ## Local mode
 `--local` (or `HUB_MODE=local`) is for development on one machine: the hub listens on `127.0.0.1` only (never other
@@ -56,7 +58,8 @@ this is written to `data/`, so the same hub started normally keeps its stored mo
 `test/conformance/e2e-hub.ts` checks a Hub server over the raw protocol (`Docs/Devices/protocol.md`): hub key and v1
 auth, devices, caller identity, default deny, grants, groups, reporter, selection, revocation and pairing. It starts
 the server twice in fresh temp directories, as `<command> --port <port> --owner <SPKI>` and without `--owner` (then it
-reads `Pairing code: XXX-XXX` from stdout or `data/pairing-code`), and exits non-zero if a check fails.
+reads `Pairing code: XXX-XXX` from stdout or `data/pairing-code`, then runs `<command> --pair` next to the running
+server), and exits non-zero if a check fails.
 
 ```sh
 bun run conformance

@@ -53,7 +53,8 @@ const now = () => Math.floor(Date.now() / 1000)
 
 /**
  * The pairing code that makes its first user an owner (protocol.md section 12). The hash lives in
- * `data/pairing.json`, the plain code in `data/pairing-code` for the launcher, both 0600.
+ * `data/pairing.json`, the plain code in `data/pairing-code` for the launcher, both 0600. The running hub re-reads
+ * `data/pairing.json` on every attempt, so a code from the one-shot `hub-server --pair` works at once.
  */
 export class Pairing {
   readonly path: string
@@ -79,19 +80,28 @@ export class Pairing {
 
   /** Loads a stored code; an expired, used up or unreadable one is removed */
   async load() {
-    try {
-      const data = await Bun.file(this.path).json()
-      if (typeof data?.salt === 'string' && typeof data.hash === 'string' && Number.isFinite(data.expires) && Number.isInteger(data.attempts)) {
-        this.state = { salt: data.salt, hash: data.hash, expires: data.expires, attempts: data.attempts }
-      }
-    } catch {}
+    await this.reload()
     if (this.active) this.scheduleExpiry()
     else await this.clear()
     return this
   }
 
+  /** Reads `data/pairing.json`, which `hub-server --pair` may have replaced from another process */
+  private async reload() {
+    this.state = await this.read()
+  }
+
+  private async read(): Promise<PairingFile | undefined> {
+    try {
+      const data = await Bun.file(this.path).json()
+      if (typeof data?.salt === 'string' && typeof data.hash === 'string' && Number.isFinite(data.expires) && Number.isInteger(data.attempts)) {
+        return { salt: data.salt, hash: data.hash, expires: data.expires, attempts: data.attempts }
+      }
+    } catch {}
+  }
+
   /**
-   * At start: a new code when `force` (`--pair`), else when `needed` (no owners) and no valid one is stored. Prints
+   * At start: a new code when `force`, else when `needed` (no owners) and no valid one is stored. Prints
    * the code. Returns the code in use, if any.
    */
   async start(options: { needed: boolean; force?: boolean }): Promise<string | undefined> {
@@ -134,6 +144,7 @@ export class Pairing {
   private async verifyNow(input: unknown) {
     const started = Date.now()
     try {
+      await this.reload()
       if (!this.active) {
         if (this.state) await this.clear()
         throw 'no pairing code'
@@ -142,8 +153,8 @@ export class Pairing {
       const code = normalizePairingCode(input)
       // Hashes even malformed input, so every answer takes the same time
       const hash = await hashCode(code ?? '', Buffer.from(state.salt, 'base64'))
-      // A new code replaced this one meanwhile
-      if (this.state !== state) throw 'invalid pairing code'
+      // `hub-server --pair` replaced the code meanwhile: leave its files alone
+      if ((await this.read())?.hash !== state.hash) throw 'invalid pairing code'
       const expected = Buffer.from(state.hash, 'base64')
       if (code && hash.length === expected.length && timingSafeEqual(hash, expected)) {
         await this.clear()
@@ -193,8 +204,9 @@ export class Pairing {
     if (!state) return
     // setTimeout overflows past about 24.8 days; codes live an hour
     const delay = Math.min(Math.max(0, state.expires * 1000 - Date.now()), 2 ** 31 - 1)
+    // Through the queue, and only if the file still holds an expired code (`--pair` may have made a new one)
     this.expiryTimer = setTimeout(() => {
-      if (this.state === state) this.clear()
+      this.queue = this.queue.then(() => this.load()).catch(() => {})
     }, delay)
     this.expiryTimer.unref?.()
   }
