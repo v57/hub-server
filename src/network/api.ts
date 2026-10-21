@@ -337,16 +337,17 @@ export class NetworkAPI {
     if (!profile.wireGuardKey) {
       throw networkError('invalid_request', 'WireGuard key is required', false)
     }
+    const inviter = admission && this.agents.getProfile(admission.inviterServiceKey)
+    const admitted = !!admission && !!inviter && admission.inviterServiceKey !== state.key
+      && validateJoinAdmission(admission, state.key, profile.wireGuardKey)
+    // A fresh invitation for this key and WireGuard key lets a member rejoin with new tunnel keys
+    // (the Hub app keeps its identity across joins); without one the bound WireGuard key stays.
     const existing = this.agents.getProfile(state.key)
-    if (existing && existing.wireGuardKey !== profile.wireGuardKey) {
+    if (existing && existing.wireGuardKey !== profile.wireGuardKey && !admitted) {
       throw networkError('forbidden', 'profile WireGuard key is already bound', false)
     }
-    if (!this.isMember(state)) {
-      const inviter = admission && this.agents.getProfile(admission.inviterServiceKey)
-      if (!admission || !inviter || admission.inviterServiceKey === state.key
-        || !validateJoinAdmission(admission, state.key, profile.wireGuardKey)) {
-        throw networkError('forbidden', 'a valid invitation admission is required to join', false)
-      }
+    if (!this.isMember(state) && !admitted) {
+      throw networkError('forbidden', 'a valid invitation admission is required to join', false)
     }
     return this.registerAuthenticatedProfile(profile, state)
   }

@@ -95,6 +95,27 @@ describe('hub/net/bind join', () => {
     expect(again.profile.overlayAddresses).toEqual((await api.bindAgent(request(), {} as never, state(joinerKey, 'x'))).profile.overlayAddresses)
   })
 
+  test('lets a member rejoin with a new WireGuard key only with a fresh admission', async () => {
+    const api = withInviter()
+    // Bound earlier with other tunnel keys, still connected
+    api.agents.registerProfile({
+      version: 1,
+      key: joinerKey,
+      wireGuardKey: admission.inviterWireGuardKey,
+      overlayAddresses: [],
+      connectedAt: new Date(issuedAt).toISOString(),
+    }, 'joiner-earlier')
+    await expect(api.bindAgent(request(), {} as never, state(joinerKey, 'joiner'))).rejects.toMatchObject({ code: 'forbidden' })
+    const realNow = Date.now
+    Date.now = () => issuedAt + 1000
+    try {
+      const rejoined = await api.bindAgent(request(admission), {} as never, state(joinerKey, 'joiner'))
+      expect(rejoined.profile.wireGuardKey).toBe(joinerWireGuardKey)
+    } finally {
+      Date.now = realNow
+    }
+  })
+
   test('keeps a disconnected member in the member list', async () => {
     const api = withInviter()
     const realNow = Date.now
