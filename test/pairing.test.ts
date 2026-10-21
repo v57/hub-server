@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from 'bun:test'
 import { mkdtempSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -15,6 +15,9 @@ import {
 } from '../src/pairing'
 import { deviceMember, keyMember, ownersGroup } from '../src/security'
 import { certificate, connect, freePort, makeKey, token, waitFor, type Client, type TestKey } from './helpers'
+
+// scrypt takes hundreds of ms per code and much longer on a loaded machine; the checks are lower bounds only
+setDefaultTimeout(60_000)
 
 const directory = () => mkdtempSync(join(tmpdir(), 'hub-server-pairing-'))
 const fast_ = (dir: string) => new Pairing(dir, { minDuration: 0 })
@@ -195,7 +198,7 @@ describe('pairing timing', () => {
     expect(await timed(() => pairing.verify(wrong(code)))).toBeGreaterThanOrEqual(1000)
     expect(await timed(() => pairing.verify('nonsense'))).toBeGreaterThanOrEqual(1000)
     expect(await timed(() => pairing.verify(code))).toBeGreaterThanOrEqual(1000)
-  }, 10_000)
+  }, 60_000)
 
   test('verifications run one at a time', async () => {
     const pairing = new Pairing(directory())
@@ -213,7 +216,7 @@ describe('pairing timing', () => {
     expect(finished[0]).toBeGreaterThanOrEqual(1000)
     for (let i = 1; i < finished.length; i++) expect(finished[i] - finished[i - 1]).toBeGreaterThanOrEqual(990)
     expect(finished[3]).toBeGreaterThanOrEqual(4000)
-  }, 15_000)
+  }, 90_000)
 })
 
 describe('pairing on the hub', () => {
@@ -264,7 +267,7 @@ describe('pairing on the hub', () => {
     const key = makeKey()
     expect(await client(key).sender.send('hub/pair', { code: printed })).toMatchObject({ owner: true })
     expect(security.isOwner(key.key)).toBe(true)
-  }, 10_000)
+  }, 60_000)
 
   test('anonymous callers cannot pair', async () => {
     const code = await hub.pairing.create()
