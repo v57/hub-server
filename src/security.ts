@@ -110,8 +110,9 @@ const publicBuiltins = new Set([
   'hub/proxy/join',
   'hub/header',
 ])
-// `hub/net/bind` keeps the proof of its bind kind, `hub/net/node` tells agents where their node is
-const authBuiltins = new Set(['hub/api/services', 'hub/net/bind', 'hub/net/node'])
+// `hub/net/bind` keeps the proof of its bind kind, `hub/net/node` tells agents where their node is, `hub/pair` makes
+// the holder of the pairing code an owner, `hub/pair/new` checks for an owner or the launcher itself
+const authBuiltins = new Set(['hub/api/services', 'hub/net/bind', 'hub/net/node', 'hub/pair', 'hub/pair/new'])
 const reporterBuiltins = new Set(['hub/device/describe', 'hub/device/data'])
 const grantBuiltins = new Set(['hub/devices', 'hub/devices/data'])
 

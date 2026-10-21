@@ -7,6 +7,7 @@ Options:
   --proxy <address>      join another hub as a proxy
   --owner <key>          trust this key as an owner (env HUBOWNER)
   --launcher <key>       let this key host launcher/* (env HUBLAUNCHER)
+  --pair                 print a new pairing code, replacing the old one (a hub without owners makes one anyway)
   -h, --help             print this help`
 
 let port: number | undefined
@@ -14,6 +15,7 @@ let merges: string[] = []
 let proxies: string[] = []
 let owners: string[] = []
 let launcher = Bun.env['HUBLAUNCHER']
+let pair = false
 const argv = process.argv.slice(2)
 while (true) {
   const command = argv.shift()
@@ -38,6 +40,9 @@ while (true) {
     case '--launcher':
       launcher = argv.shift()
       break
+    case '--pair':
+      pair = true
+      break
     case '-h':
     case '--help':
       console.log(help)
@@ -55,6 +60,7 @@ owners.forEach(id => security.addOwner(id))
 if (launcher?.length) security.launcher = launcher
 
 const hub = new Hub(port)
+hub.startPairing(pair).catch(error => console.error('Pairing code unavailable:', error))
 merges.forEach(address => {
   hub.merger.connect(address, hub, false)
 })

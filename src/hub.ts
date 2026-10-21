@@ -6,7 +6,7 @@ import { settings } from './settings.ts'
 import { publicKey } from './keychain.ts'
 import * as LoadBalancer from './load balancers.ts'
 import type { Cancellable } from 'channel/channel'
-import { Security, builtinAccess, ownersGroup, type Caller, type Principal } from './security.ts'
+import { Security, builtinAccess, deviceMember, keyMember, ownersGroup, type Caller, type Principal } from './security.ts'
 import { randomUUIDv7 } from 'bun'
 import {
   appleAgentAPIsEnabled,
@@ -19,6 +19,7 @@ import { HubHeaderStore, registerHubHeaderAPIs } from './header'
 import { HubNetNodeStore } from './network/node-store'
 import { HubDevices } from './hub-devices'
 import { FreshState } from './fresh-state'
+import { Pairing } from './pairing'
 import type { Certificate } from './devices'
 
 export type { Sender } from 'channel/client'
@@ -71,6 +72,7 @@ export class Hub {
   header = new HubHeaderStore()
   hubNetNode = new HubNetNodeStore()
   devices = new HubDevices(this, security)
+  pairing = new Pairing()
   ready: Promise<void>
   apiList = new LazyStates<State, string[]>(state => this.allowedApi(security.caller(state)))
   /** Keyed by JSON `[key, device, path]` */
@@ -142,6 +144,7 @@ export class Hub {
       this.header.load(),
       this.hubNetNode.load(),
       this.devices.load(security.hubKey),
+      this.pairing.load(),
     ]).then(() => {
       hubNetNode.setNeedsUpdate()
     })
@@ -160,6 +163,19 @@ export class Hub {
     this.devices.register(this.channel)
     this.channel
       .post('hub/info', () => ({ key: security.hubKey, protocol: 1, pro: true, mode: security.effectiveMode }))
+      .post('hub/pair', async ({ body, state, sender }) => {
+        if (!state.key || this.merger.connectionFor(sender)) throw 'unauthorized'
+        await this.pairing.verify(body?.code)
+        this.addPairedOwner(state)
+        return { owner: true, hubKey: security.hubKey, name: (await this.header.load()).name }
+      })
+      .post('hub/pair/new', async ({ state, sender }) => {
+        const launcher = !!security.launcher && state.key === security.launcher
+        if (this.merger.connectionFor(sender) || !(launcher || security.isOwner(state))) throw 'permissions required'
+        const code = await this.pairing.create()
+        console.log(`Pairing code: ${code}`)
+        return { code, expires: this.pairing.expires }
+      })
       .stream('hub/security/mode', () => securityMode.makeIterator())
       .post('hub/security/mode/set', ({ body }) => {
         security.setMode({ mode: body?.mode, requireV1: body?.requireV1 })
@@ -489,6 +505,22 @@ export class Hub {
   }
   stats() {
     this.services.map(a => a)
+  }
+  /** At start: a pairing code when the hub has no owners or `force` (`--pair`), see `Pairing.start` */
+  async startPairing(force = false): Promise<string | undefined> {
+    await this.ready
+    return this.pairing.start({ needed: security.members.members(ownersGroup).size === 0, force })
+  }
+  /** `hub/pair` succeeded: the key and, with a certificate, its device (approved) join the owners */
+  private addPairedOwner(state: State) {
+    security.members.add(ownersGroup, keyMember(state.key!))
+    const id = state.certificate?.deviceId
+    if (id) {
+      this.devices.approve(id)
+      security.members.add(ownersGroup, deviceMember(id))
+    }
+    this.connectionsChanged()
+    console.log('Paired owner', state.key, id ? `on device ${id}` : '')
   }
   servicesFor(path: string, principal: Principal): ServiceProvider[] {
     if (!path || !this.api.has(path)) return []
