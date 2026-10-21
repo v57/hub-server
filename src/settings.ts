@@ -1,9 +1,24 @@
 import type { Name as LoadBalancer } from './load balancers'
-import { mkdir, rename, unlink, writeFile } from 'fs/promises'
+import { chmod, mkdir, rename, stat, unlink, writeFile } from 'fs/promises'
 import { dirname } from 'path'
-try {
-  await mkdir('data', { recursive: true })
-} catch {}
+await securePrivate('data', 0o700, true)
+
+/**
+ * Creates `path` (a directory when `directory`) and takes away group and other access from it, also from one an
+ * older hub-server made 0755 / 0644. Holds the hub key, so only this user may read it.
+ */
+export async function securePrivate(path: string, mode: number, directory = false) {
+  try {
+    if (directory) await mkdir(path, { recursive: true, mode })
+    const current = (await stat(path)).mode & 0o777
+    if (current & 0o077) {
+      await chmod(path, mode)
+      console.log(`Made ${path} private (${current.toString(8)} → ${mode.toString(8)})`)
+    }
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') console.error(`Failed to secure ${path}:`, error)
+  }
+}
 
 interface Settings {
   merge: string[]

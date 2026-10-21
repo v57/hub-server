@@ -214,7 +214,7 @@ export class Pairing {
 
 /** Writes a 0600 file through a temp file and a rename */
 async function writePrivate(path: string, text: string) {
-  await mkdir(path.slice(0, path.lastIndexOf('/')) || '.', { recursive: true })
+  await mkdir(path.slice(0, path.lastIndexOf('/')) || '.', { recursive: true, mode: 0o700 })
   const temp = `${path}.${process.pid}.${Date.now()}.tmp`
   await writeFile(temp, text, { mode: 0o600 })
   await chmod(temp, 0o600)

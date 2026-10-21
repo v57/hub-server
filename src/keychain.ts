@@ -1,5 +1,5 @@
 import crypto from 'crypto'
-import { writeAtomically } from './settings'
+import { securePrivate, writeAtomically } from './settings'
 
 let loadedKey: Promise<string> | undefined
 
@@ -24,12 +24,13 @@ async function loadKey(): Promise<string> {
 async function loadStoredKey(): Promise<string> {
   const file = Bun.file('data/auth')
   if (await file.exists()) {
+    await securePrivate('data/auth', 0o600)
     const key = (await file.text()).trim()
     if (!key) throw new Error('data/auth is empty')
     return key
   }
   const key = await generateKey()
-  await writeAtomically('data/auth', key)
+  await writeAtomically('data/auth', key, 0o600)
   return key
 }
 async function generateKey(): Promise<string> {
