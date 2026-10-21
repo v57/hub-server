@@ -121,6 +121,27 @@ describe('service features', () => {
     })
   })
 
+  describe('streams', () => {
+    test('a caller leaving a stream cancels it at the provider while the provider waits', async () => {
+      const key = makeKey()
+      security.host.allow(key.key, ['feed/live'])
+      const c = client(key)
+      let cancelled = false
+      let sent = false
+      c.channel.stream('feed/live', () => ({
+        next: () => (sent ? new Promise(() => {}) : ((sent = true), Promise.resolve({ value: 'first', done: false }))),
+        return: async () => ((cancelled = true), { value: undefined, done: true }),
+      }))
+      await c.sender.send('hub/service/update', { services: [{ path: 'feed/live' }] })
+      for await (const value of owners.sender.values('feed/live')) {
+        expect(value).toBe('first')
+        break
+      }
+      await waitFor(() => cancelled)
+      await waitFor(() => hub.services.get('feed/live')!.status.running === 0)
+    })
+  })
+
   describe('hub/grant/check', () => {
     const user = makeKey()
     let service: Client

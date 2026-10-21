@@ -259,6 +259,29 @@ try {
     second.ws?.close?.()
   })
 
+  await check('a caller leaving a stream cancels it at a waiting provider', async () => {
+    const key = newKey()
+    let cancelled = false
+    let sent = false
+    const channel = new Channel<any>()
+    channel.stream('e2e/feed', () => ({
+      next: () => (sent ? new Promise(() => {}) : ((sent = true), Promise.resolve({ value: 'first', done: false }))),
+      return: async () => ((cancelled = true), { value: undefined, done: true }),
+    }) as any)
+    const provider = channel.connect(address, {
+      headers: () => auth(key, hubKey),
+      async onConnect(s) { await s.send('hub/service/update', { services: [{ path: 'e2e/feed' }] }) },
+    })
+    await wait(300)
+    await ownerC.send('hub/host/update', { key: key.pub, allow: ['e2e/feed'] })
+    await wait(300)
+    const value = await first(ownerC.values('e2e/feed'), () => true)
+    assert(value === 'first', `stream value ${JSON.stringify(value)}`)
+    for (let i = 0; i < 40 && !cancelled; i += 1) await wait(50)
+    assert(cancelled, 'the provider never saw the cancel')
+    provider.ws?.close?.()
+  })
+
   // 5. revoke
   await check('revoke closes the service and refuses its key', async () => {
     await ownerC.send('hub/device/revoke', { id: deviceId(devKey) })

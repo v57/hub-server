@@ -461,7 +461,7 @@ export class Hub {
           statusState.setNeedsUpdate()
         }
       })
-      .streamOther(other, async function* ({ body, path, context, state, sender }) {
+      .streamOther(other, async ({ body, path, context, state, sender }) => {
         const service = services.get(path)
         if (!service) throw HubError.notFound()
         const caller = hub.caller(state, sender, context)
@@ -477,14 +477,11 @@ export class Hub {
         requests += 1
         s.streams += 1
         statusState.setNeedsUpdate()
-        try {
-          for await (const value of s.sender.values(path, body, { context: forwardedContext(context, caller) })) {
-            yield value
-          }
-        } finally {
-          s.streams -= 1
-          service.completed(s)
-        }
+        const provider = s
+        return new ForwardedStream(provider.sender.values(path, body, { context: forwardedContext(context, caller) }), () => {
+          provider.streams -= 1
+          service.completed(provider)
+        })
       })
       .onDisconnect((state, sender) => {
         const context = this.merger.context()
@@ -660,6 +657,46 @@ export class Hub {
 }
 
 const other = () => true
+
+/**
+ * A provider's stream as the hub passes it on. Cancelling it cancels the provider's stream at once, also while a
+ * value is pending: an async generator would only see `return()` once the provider sent its next value.
+ */
+class ForwardedStream implements AsyncIterator<any, void, any> {
+  private finished = false
+  private stop!: (result: IteratorResult<any, void>) => void
+  private readonly stopped = new Promise<IteratorResult<any, void>>(resolve => (this.stop = resolve))
+  constructor(
+    private readonly values: AsyncIterator<any, void, any>,
+    private readonly onFinish: () => void,
+  ) {}
+  next(): Promise<IteratorResult<any, void>> {
+    if (this.finished) return Promise.resolve({ done: true, value: undefined })
+    return Promise.race([this.values.next(), this.stopped]).then(
+      result => {
+        if (result.done) this.finish()
+        return result
+      },
+      error => {
+        this.finish()
+        throw error
+      },
+    )
+  }
+  async return(): Promise<IteratorResult<any, void>> {
+    if (!this.finished) {
+      this.finish()
+      this.stop({ done: true, value: undefined })
+      await this.values.return?.()
+    }
+    return { done: true, value: undefined }
+  }
+  private finish() {
+    if (this.finished) return
+    this.finished = true
+    this.onFinish()
+  }
+}
 
 /** The client's context with `hub` replaced by the caller (protocol.md section 4) */
 export function forwardedContext(context: any, caller: Caller): any {
