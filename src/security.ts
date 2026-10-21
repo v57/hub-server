@@ -382,7 +382,8 @@ export class Security implements SecurityInterface {
         if (!caller.key) throw 'unauthorized'
         return
       case 'grant':
-        if (caller.owner || (!this.lockdown && this.granted(caller, path))) return
+        // Approved devices are members and read the directory of their hub; others need a grant
+        if (caller.owner || (!this.lockdown && (caller.device || this.granted(caller, path)))) return
         throw 'permissions required'
       case 'owner':
         if (caller.owner) return

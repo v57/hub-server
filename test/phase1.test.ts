@@ -131,6 +131,17 @@ describe('built-in API classification', () => {
   ])('%s is %s', (path, access) => {
     expect(builtinAccess(path)).toBe(access as any)
   })
+
+  test('approved devices read the directory, keys alone and owner-only paths need more', () => {
+    const security = new Security()
+    const device = { key: 'k', device: { id: 'd', name: 'iPhone' }, groups: [], owner: false }
+    const keyOnly = { key: 'k', groups: [], owner: false }
+    expect(security.allowsBuiltin(device, 'hub/devices')).toBe(true)
+    expect(security.allowsBuiltin(device, 'hub/devices/data')).toBe(true)
+    expect(security.allowsBuiltin(keyOnly, 'hub/devices')).toBe(false)
+    expect(security.allowsBuiltin(device, 'hub/devices/pending')).toBe(false)
+    expect(security.allowsBuiltin(device, 'hub/device/revoke')).toBe(false)
+  })
 })
 
 describe('forwarded context', () => {
