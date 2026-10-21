@@ -79,6 +79,8 @@ export class Hub {
   connections = new Set<BodyContext<State>>()
   merger = new HubMerger(this)
   proxies = new Map<string, Sender>()
+  /** Streams forwarded to each provider connection, ended when it disconnects */
+  forwarded = new Map<Sender, Set<ForwardedStream>>()
   apps = new Apps()
   api = new Set<string>()
   networkAPI?: NetworkAPI
@@ -478,12 +480,21 @@ export class Hub {
         s.streams += 1
         statusState.setNeedsUpdate()
         const provider = s
-        return new ForwardedStream(provider.sender.values(path, body, { context: forwardedContext(context, caller) }), () => {
+        const forwarded: ForwardedStream = new ForwardedStream(provider.sender.values(path, body, { context: forwardedContext(context, caller) }), () => {
           provider.streams -= 1
           service.completed(provider)
+          hub.forwarded.get(provider.sender)?.delete(forwarded)
         })
+        let streams = hub.forwarded.get(provider.sender)
+        if (!streams) hub.forwarded.set(provider.sender, (streams = new Set()))
+        streams.add(forwarded)
+        return forwarded
       })
       .onDisconnect((state, sender) => {
+        // Streams this provider was serving would otherwise wait forever: end them so callers can resubscribe
+        const streams = this.forwarded.get(sender)
+        this.forwarded.delete(sender)
+        streams?.forEach(stream => stream.fail(new HubError('service disconnected', 'unavailable')))
         const context = this.merger.context()
         this.removeServices(sender, state, Array.from(state.services), context)
         const sendUpdates = state.apps.size > 0
@@ -665,11 +676,25 @@ const other = () => true
 class ForwardedStream implements AsyncIterator<any, void, any> {
   private finished = false
   private stop!: (result: IteratorResult<any, void>) => void
-  private readonly stopped = new Promise<IteratorResult<any, void>>(resolve => (this.stop = resolve))
+  private abort!: (error: unknown) => void
+  private readonly stopped = new Promise<IteratorResult<any, void>>((resolve, reject) => {
+    this.stop = resolve
+    this.abort = reject
+  })
   constructor(
     private readonly values: AsyncIterator<any, void, any>,
     private readonly onFinish: () => void,
-  ) {}
+  ) {
+    // A failure nobody is waiting for yet isn't unhandled: the next `next()` sees it
+    this.stopped.catch(() => {})
+  }
+  /** Ends the stream for the caller with `error` (its provider went away) */
+  fail(error: unknown) {
+    if (this.finished) return
+    this.finish()
+    this.abort(error)
+    void Promise.resolve(this.values.return?.()).catch(() => {})
+  }
   next(): Promise<IteratorResult<any, void>> {
     if (this.finished) return Promise.resolve({ done: true, value: undefined })
     return Promise.race([this.values.next(), this.stopped]).then(

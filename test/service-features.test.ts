@@ -140,6 +140,22 @@ describe('service features', () => {
       await waitFor(() => cancelled)
       await waitFor(() => hub.services.get('feed/live')!.status.running === 0)
     })
+    test('a provider that disconnects ends its streams with unavailable, so callers can resubscribe', async () => {
+      const key = makeKey()
+      security.host.allow(key.key, ['feed/ticks'])
+      const c = client(key)
+      let sent = false
+      c.channel.stream('feed/ticks', () => ({
+        next: () => (sent ? new Promise(() => {}) : ((sent = true), Promise.resolve({ value: 'tick', done: false }))),
+      }))
+      await c.sender.send('hub/service/update', { services: [{ path: 'feed/ticks' }] })
+      const iterator = owners.sender.values('feed/ticks')[Symbol.asyncIterator]()
+      expect((await iterator.next()).value).toBe('tick')
+      const pending = failure(iterator.next())
+      c.sender.stop()
+      expect(await pending).toEqual({ message: 'service disconnected', code: 'unavailable' })
+      await waitFor(() => (hub.services.get('feed/ticks')?.status.running ?? 0) === 0)
+    })
   })
 
   describe('hub/grant/check', () => {
