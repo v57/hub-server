@@ -6,7 +6,8 @@
     "hub-server": "index.ts"
   },
   "scripts": {
-    "start": "bun ."
+    "start": "bun .",
+    "conformance": "bun test/conformance/e2e-hub.ts"
   },
   "devDependencies": {
     "@types/bun": "^1.3.11"

@@ -52,6 +52,20 @@ still-valid code survives restarts; `--pair` replaces it.
 interfaces), runs `default-allow`, treats the launcher key (`HUBLAUNCHER`) as an owner and makes no pairing code. None of
 this is written to `data/`, so the same hub started normally keeps its stored mode and owners.
 
+## Conformance harness
+`test/conformance/e2e-hub.ts` checks a Hub server over the raw protocol (`Docs/Devices/protocol.md`): hub key and v1
+auth, devices, caller identity, default deny, grants, groups, reporter, selection, revocation and pairing. It starts
+the server twice in fresh temp directories, as `<command> --port <port> --owner <SPKI>` and without `--owner` (then it
+reads `Pairing code: XXX-XXX` from stdout or `data/pairing-code`), and exits non-zero if a check fails.
+
+```sh
+bun run conformance
+# another server, such as the Swift HubServer
+HUB_SERVER_CMD='swift run --package-path ../HubServer hub-server-swift' bun run conformance
+```
+
+`HUB_SERVER_CMD` runs through `sh` (default: this repo's `index.ts`); `HUB_SERVER_START_TIMEOUT` is in seconds (30).
+
 ## Load balancers:
 - `random` will call random service
 - `counter` will call next service in the list
