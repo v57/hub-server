@@ -29,7 +29,7 @@ export function appleAgentAPIsEnabled(
  * - Network share registration
  * - Agent profile registration
  * - Resource and provider management
- * - Connection grants and rendezvous tickets
+ * - Connection grants and peer link grants
  * - Permission-filtered streams
  */
 
@@ -38,7 +38,7 @@ export const networkProtectedApi = {
   'network/shares/published': 'Hub Network: Manage Shares',
   'hub/net/bind': 'Hub Network: Bind Agent',
   'network/connection/grant': 'Hub Network: Connection Grant',
-  'network/rendezvous/ticket': 'Hub Network: Rendezvous Ticket',
+  'network/links': 'Hub Network: Peer Links',
   'network/resource/update': 'Hub Network: Manage Resources',
   'network/resource/revoke': 'Hub Network: Manage Resources',
   'network/resource/list': 'Hub Network: View Resources',
@@ -154,14 +154,13 @@ export function registerNetworkAPIs(
     return { grant }
   })
 
-  // Rendezvous ticket issuance
-  channel.post('network/rendezvous/ticket', async ({ body, state }) => {
-    const ticket = await networkAPI.issueRendezvousTicket(
-      body.nodeId,
-      body.roles ?? ['rendezvous'],
-      state,
-    )
-    return { ticket }
+  // Peer link grants, with the coordinator to meet the other side at
+  const linksState = new LazyStates<State, Wire.PeerLinks | Promise<Wire.PeerLinks>>(
+    state => networkAPI.links(state),
+  ).dedupe('json')
+  channel.stream('network/links', ({ state }) => {
+    networkAPI.authenticatedProfile(state)
+    return linksState.makeIterator(state)
   })
 
   channel.post('network/gateway/advertise', ({ body, state }) => {
@@ -293,6 +292,7 @@ export function registerNetworkAPIs(
     gatewayState.setNeedsUpdate()
     gatewayRevocations.setNeedsUpdate()
     gatewayDiagnostics.setNeedsUpdate()
+    linksState.setNeedsUpdate()
   }
 
   return networkAPI

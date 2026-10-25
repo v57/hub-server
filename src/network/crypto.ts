@@ -12,6 +12,7 @@ export type SignaturePurpose =
   | 'gateway-grant'
   | 'apple-app-agent-readiness'
   | 'direct-bootstrap-response'
+  | 'peer-link'
 
 export const SIGNATURE_DOMAINS: Record<SignaturePurpose, string> = {
   'agent-attestation': 'hub-network/agent-attestation/v1',
@@ -22,6 +23,7 @@ export const SIGNATURE_DOMAINS: Record<SignaturePurpose, string> = {
   'gateway-grant': 'hub-network/gateway-grant/v1',
   'apple-app-agent-readiness': 'hub-network/apple-app-agent-readiness/v1',
   'direct-bootstrap-response': 'hub-network/direct-bootstrap-response/v1',
+  'peer-link': 'hub-network/peer-link/v1',
 }
 
 function canonicalJSON(value: unknown): string {

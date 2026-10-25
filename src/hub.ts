@@ -29,10 +29,15 @@ security.hubKey = await publicKey()
 
 const paddr = (a?: string) => (a ? (isNaN(Number(a)) ? a : Number(a)) : 1997)
 
+/** The port of a listen address: `1997` and `0.0.0.0:1997` → `1997` */
+export function listenPort(address: number | string): number | undefined {
+  const port = typeof address === 'number' ? address : Number(address.slice(address.lastIndexOf(':') + 1))
+  return Number.isInteger(port) && port > 0 ? port : undefined
+}
+
 /** The listen address on 127.0.0.1 only, keeping its port: `1997` and `0.0.0.0:1997` → `127.0.0.1:1997` */
 export function localAddress(address: number | string): string {
-  const port = typeof address === 'number' ? address : Number(address.slice(address.lastIndexOf(':') + 1))
-  return `127.0.0.1:${Number.isInteger(port) && port > 0 ? port : 1997}`
+  return `127.0.0.1:${listenPort(address) ?? 1997}`
 }
 
 export interface HubOptions {
@@ -149,6 +154,9 @@ export class Hub {
       if (state.certificate) this.devices.approve(state.certificate.deviceId)
     }
     networkAPI.deviceLabel = id => this.devices.registry.device(id)?.name
+    networkAPI.coordinator = () => this.hubNetNode.value
+    const port = listenPort(address)
+    if (port) networkAPI.hubPort = port
     this.devices.networkState = id => networkAPI.deviceNetworkState(id)
     this.devices.overlay = id => networkAPI.deviceOverlay(id)
     this.devices.onRemoved = ({ id, revokedKeys }) => networkAPI.removeDevice(id, revokedKeys)
@@ -170,6 +178,7 @@ export class Hub {
       this.local ? undefined : this.pairing.load(),
     ]).then(() => {
       hubNetNode.setNeedsUpdate()
+      networkAPI.onStateChanged?.()
     })
 
     // Built-in APIs by access class (protocol.md section 7); service paths are checked when forwarded
@@ -213,6 +222,7 @@ export class Hub {
         security.requireOwner(state, path)
         await this.hubNetNode.set(body)
         hubNetNode.setNeedsUpdate()
+        networkAPI.onStateChanged?.()
       })
       .post('hub/profile/update', ({ body: { name, icon }, state }) => {
         if (icon) state.icon = icon

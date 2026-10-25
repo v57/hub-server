@@ -193,6 +193,48 @@ export interface RendezvousTicket extends Versioned {
   signature: Base64
 }
 
+/** One device of a peer link grant */
+export interface PeerLinkSide {
+  key: string
+  wireGuardKey: string
+  member: string
+  addresses: string[]
+}
+
+export interface PeerLinkPort {
+  protocol: 'tcp' | 'udp'
+  port: number
+}
+
+/**
+ * A hub-signed link between two devices (hub-net-node's PROTOCOL.md, "Peer links"). `hub` links a member (`a`) to the
+ * hub's machine (`b`): the member routes `aViaB` through it and may open `aToB` on it.
+ */
+export interface PeerLinkGrant extends Versioned {
+  grantId: string
+  hubKey: string
+  hubNetworkId: string
+  purpose: 'hub' | 'gateway' | 'share'
+  a: PeerLinkSide
+  b: PeerLinkSide
+  aViaB: string[]
+  bViaA: string[]
+  aToB: PeerLinkPort[]
+  bToA: PeerLinkPort[]
+  issuedAt: Timestamp
+  expiresAt: Timestamp
+  signature: Base64
+}
+
+/** `network/links`: the caller's grants, the coordinator to meet the other side at, and whether it's the hub's machine */
+export interface PeerLinks extends Versioned {
+  hubKey: string
+  hubNetworkId: string
+  coordinator: string
+  hubHost: boolean
+  grants: PeerLinkGrant[]
+}
+
 export type CandidateKind = 'host' | 'server-reflexive'
 export type CandidateTransport = 'udp'
 

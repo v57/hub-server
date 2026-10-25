@@ -5,7 +5,8 @@ import type {
   LiveProvider,
   AgentProfile,
   ConnectionGrant,
-  RendezvousTicket,
+  PeerLinkGrant,
+  PeerLinks,
   NetworkPolicy,
   HubNetworkMessage,
   WireEnvelope,
@@ -27,7 +28,6 @@ import type {
 import { networkError, HUB_NETWORK_WIRE_VERSION } from './wire'
 import {
   CONNECTION_GRANT_MAX_LIFETIME_MS,
-  RENDEZVOUS_TICKET_MAX_LIFETIME_MS,
   GATEWAY_GRANT_MAX_LIFETIME_MS,
   signatureInput,
   verifyEnvelope,
@@ -45,6 +45,13 @@ import type { Grant } from '../grants'
 import { createPublicKey } from 'crypto'
 import { LocalAgentBindingStore } from './local-agent'
 import type { AppleLocalAgentBinding } from './local-agent'
+import { defaultHubNetNode } from './node-store'
+
+/** A peer link grant lasts a month */
+export const PEER_LINK_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000
+
+/** `100.96.0.2` → `100.96.0.2/32`, an IPv6 address → `/128` */
+export const hostRoute = (address: string) => address.includes(':') ? `${address}/128` : `${address}/32`
 
 type ChallengeSigner = (challenge: Uint8Array) => Promise<string>
 
@@ -56,7 +63,7 @@ type ChallengeSigner = (challenge: Uint8Array) => Promise<string>
  * - Policy management (hub, group, keys, private, disabled)
  * - Live provider tracking
  * - Connection grant issuance
- * - Rendezvous ticket issuance
+ * - Peer link grants
  * - Permission-filtered streams
  */
 export class NetworkAPI {
@@ -85,6 +92,12 @@ export class NetworkAPI {
   private agentDevices = new Map<string, string>()
   /** Approves a pending device whose agent passed its bind proof (protocol.md section 10) */
   onBindApprove: ((state: State) => void) | undefined
+  /** The coordinator (hub-net-node) devices meet each other at */
+  coordinator: () => string = () => defaultHubNetNode
+  /** The port the hub listens on, which a member's `hub` link lets it open on the hub's machine */
+  hubPort = 1997
+  /** Issued peer link grants by their sides */
+  private peerLinkGrants = new Map<string, PeerLinkGrant>()
 
   constructor(
     private security: Security,
@@ -605,49 +618,77 @@ export class NetworkAPI {
   }
 
   /**
-   * Issue a rendezvous ticket.
+   * `network/links`: the caller's peer link grants (hub-net-node's PROTOCOL.md, "Peer links"). Each member gets a
+   * `hub` link to the hub's machine, so it reaches the hub over a direct WireGuard path the coordinator introduces, also
+   * from a network where it can't reach the hub itself. Devices check a grant against the hub key they pinned and
+   * decide on their own; the coordinator only forwards it.
    */
-  async issueRendezvousTicket(
-    nodeId: string,
-    roles: string[],
-    state: State,
-  ): Promise<RendezvousTicket> {
-    if (!state.key) {
-      throw networkError('unauthorized', 'authentication required', false)
-    }
-
-    const { hubNetworkId, hubKey } = this.registry.getIdentity()
-
-    // Verify profile is registered
-    const profile = this.agents.getProfile(state.key)
-    if (!profile) {
-      throw networkError('unauthorized', 'agent profile not registered', false)
-    }
-    if (roles.length !== 1 || roles[0] !== 'rendezvous') {
-      throw networkError('invalid_request', 'only the rendezvous node role is supported', false)
-    }
-
-    const ticketId = randomUUIDv7()
-    const issuedAt = new Date().toISOString()
-    const expiresAt = new Date(Date.now() + RENDEZVOUS_TICKET_MAX_LIFETIME_MS).toISOString()
-
-    const ticket: RendezvousTicket = {
+  async links(state: State): Promise<PeerLinks> {
+    const caller = this.authenticatedProfile(state)
+    const host = this.hubHostProfile()
+    const grants: PeerLinkGrant[] = []
+    if (host && host.key !== caller.key) grants.push(await this.peerLinkGrant('hub', caller, host))
+    const { hubKey, hubNetworkId } = this.registry.getIdentity()
+    return {
       version: HUB_NETWORK_WIRE_VERSION,
-      ticketId,
       hubKey,
       hubNetworkId,
-      key: state.key,
-      nodeId,
-      roles: roles as ['rendezvous'],
-      sessionPurpose: 'peer-connect',
-      issuedAt,
-      expiresAt,
+      coordinator: this.coordinator(),
+      hubHost: host?.key === caller.key,
+      grants,
+    }
+  }
+
+  /** The profile of the agent bound as the hub's own (the machine agent, or the Hub app on that machine), while it's registered */
+  hubHostProfile(): AgentProfile | undefined {
+    const key = this.localAgent.status().key
+    return key ? this.agents.getProfile(key) : undefined
+  }
+
+  /**
+   * The signed `hub` grant between a member and the hub's machine: the member routes the machine's overlay addresses
+   * through it and may open the hub's port, the machine routes the member's addresses back. Reused until half of its
+   * lifetime has passed.
+   */
+  private async peerLinkGrant(purpose: 'hub', member: AgentProfile, host: AgentProfile): Promise<PeerLinkGrant> {
+    const cacheKey = [purpose, member.key, member.wireGuardKey, host.key, host.wireGuardKey,
+      ...member.overlayAddresses, ...host.overlayAddresses, String(this.hubPort)].join('\0')
+    const cached = this.peerLinkGrants.get(cacheKey)
+    if (cached && Date.parse(cached.expiresAt) - Date.now() > PEER_LINK_LIFETIME_MS / 2) return cached
+    const { hubKey, hubNetworkId } = this.registry.getIdentity()
+    const now = Date.now()
+    const side = (profile: AgentProfile) => ({
+      key: profile.key,
+      wireGuardKey: profile.wireGuardKey,
+      member: profile.member ?? profile.key,
+      addresses: profile.overlayAddresses,
+    })
+    const grant: PeerLinkGrant = {
+      version: HUB_NETWORK_WIRE_VERSION,
+      grantId: randomUUIDv7(),
+      hubKey,
+      hubNetworkId,
+      purpose,
+      a: side(member),
+      b: side(host),
+      aViaB: host.overlayAddresses.map(hostRoute),
+      bViaA: member.overlayAddresses.map(hostRoute),
+      aToB: [{ protocol: 'tcp', port: this.hubPort }],
+      bToA: [],
+      issuedAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + PEER_LINK_LIFETIME_MS).toISOString(),
       signature: '',
     }
+    grant.signature = await this.challengeSigner(signatureInput('peer-link', grant))
+    this.peerLinkGrants.set(cacheKey, grant)
+    return grant
+  }
 
-    ticket.signature = await this.challengeSigner(signatureInput('rendezvous-ticket', ticket))
-
-    return ticket
+  /** A revoked device's grants are never handed out again */
+  private forgetPeerLinkGrants(key: string): void {
+    for (const cacheKey of [...this.peerLinkGrants.keys()]) {
+      if (cacheKey.split('\0').includes(key)) this.peerLinkGrants.delete(cacheKey)
+    }
   }
 
   advertiseGateway(capability: GatewayCapability, endpoint: string, state: State): GatewayStatus {
@@ -766,7 +807,7 @@ export class NetworkAPI {
     return grant
   }
 
-  private authenticatedProfile(state: State): AgentProfile {
+  authenticatedProfile(state: State): AgentProfile {
     if (!state.key) throw networkError('unauthorized', 'authentication required', false)
     const profile = this.agents.getProfile(state.key)
     if (!profile || profile.key !== state.key) {
@@ -1001,6 +1042,7 @@ export class NetworkAPI {
    * addresses. Their WireGuard keys go to `network/devices/revoked` so every agent drops them as peers.
    */
   removeDevice(device: string, revokedKeys: string[] = []): void {
+    for (const key of revokedKeys) this.forgetPeerLinkGrants(key)
     const wireGuardKeys = new Set<string>()
     for (const key of [deviceMemberKey(device), ...revokedKeys]) {
       const member = this.registry.removeMember(key)
