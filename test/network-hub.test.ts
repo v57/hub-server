@@ -36,11 +36,12 @@ describe('Hub Network on the hub', () => {
   })
   afterAll(() => clients.forEach(c => c.sender.stop()))
 
-  test('there is no built-in node', async () => {
-    expect(await first(owners, 'hub/net/node')).toBeNull()
+  test("the node is v57's coordinator until an owner sets another", async () => {
+    expect(await first(owners, 'hub/net/node')).toBe('wss://v57.dev:1964')
     await owners.sender.send('hub/net/node/set', 'node.example:443')
-    expect(await until(owners, 'hub/net/node', value => value !== null)).toBe('node.example:443')
+    expect(await until(owners, 'hub/net/node', value => value === 'node.example:443')).toBe('node.example:443')
     await owners.sender.send('hub/net/node/set', null)
+    expect(await until(owners, 'hub/net/node', value => value === 'wss://v57.dev:1964')).toBe('wss://v57.dev:1964')
   })
 
   test('revoking a device removes its member and tells the other agents', async () => {
