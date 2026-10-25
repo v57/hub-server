@@ -62,11 +62,11 @@ typealias HubNetInfo {
 ```
 
 stream `hub/net/node` Void -> String
-Returns current hub-net-node address (default: `hub.v57.dev/node`)
+Returns current hub-net-node address (default: `wss://v57.dev:1964`)
 
 post `hub/net/node/set` String? -> Void
 Permission: Owner only
-Sets hub-net-node address (default: `hub.v57.dev/node`)
+Sets hub-net-node address; `null` goes back to the default (`wss://v57.dev:1964`)
 
 Connection state now should have ip address to separate devices and see which one is local
 
@@ -85,7 +85,7 @@ agent: Generates code in format `$publicKey.$expires.$nonce?query` signs and app
 - publicKey: agent public key,
 - signature: `$nonce.$expires` signed by agent's private key
 query commands (all optional):
-- e: endpoint address (default: `hub.v57.dev/node`) (example: `e=34.25.235.23`)
+- e: endpoint address, required (example: `e=wss://v57.dev:1964`)
 client: Converts that code to `hub://join/$publicKey.$expires.$nonce?query/$signature` and copies to clipboard
 
 ## Join Invite
