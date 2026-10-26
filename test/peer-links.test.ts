@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { NetworkAPI, hostRoute } from '../src/network/api'
 import { signEnvelope, verifyEnvelope } from '../src/network/crypto'
-import { HUB_NETWORK_WIRE_VERSION, type AgentBindRequest, type AppleAppAgentReadinessAssertion } from '../src/network/wire'
+import { HUB_NETWORK_WIRE_VERSION, type AgentAttestation, type AgentBindRequest, type AppleAppAgentReadinessAssertion, type NetworkPolicy } from '../src/network/wire'
 import { Security } from '../src/security'
 import type { State } from '../src/hub'
 import { makeKey, type TestKey } from './helpers'
@@ -39,8 +39,8 @@ describe('Peer links', () => {
     return key
   }
 
-  test('members get a signed hub link to the hub\'s machine', async () => {
-    // The hub's machine: an owner bound as the Apple app agent
+  /** The hub's machine: an owner bound as the Apple app agent */
+  const hubMachine = async () => {
     const machine = owner()
     const machineState = state(machine)
     await api.bindAgent(bind('wg-machine'), {} as never, machineState)
@@ -59,7 +59,11 @@ describe('Peer links', () => {
     }
     assertion.signature = signEnvelope('apple-app-agent-readiness', assertion, machine.privateKey)
     api.bindAppleAppAgent({ version: HUB_NETWORK_WIRE_VERSION, assertion }, machineState)
+    return { machine, machineState }
+  }
 
+  test('members get a signed hub link to the hub\'s machine', async () => {
+    const { machine, machineState } = await hubMachine()
     const phone = owner()
     const phoneState = state(phone)
     await api.bindAgent(bind('wg-phone'), {} as never, phoneState)
@@ -84,5 +88,48 @@ describe('Peer links', () => {
     expect(await api.links(machineState)).toMatchObject({ hubHost: true, grants: [] })
     // Without a registered profile there's nothing to link
     await expect(api.links(state(makeKey()))).rejects.toMatchObject({ code: 'unauthorized' })
+  })
+
+  test('the hub link opens the ports of the machine\'s shares the member may open', async () => {
+    const { machine } = await hubMachine()
+    const service = makeKey()
+    const serviceState = state(service)
+    const share = (name: string, port: number, policy: NetworkPolicy) => {
+      const now = Date.now()
+      const attestation: AgentAttestation = {
+        version: HUB_NETWORK_WIRE_VERSION,
+        attestationId: crypto.randomUUID(),
+        serviceKey: service.key,
+        key: machine.key,
+        shareName: name,
+        protocol: 'tcp',
+        target: { host: '127.0.0.1', port },
+        issuedAt: new Date(now).toISOString(),
+        expiresAt: new Date(now + 60_000).toISOString(),
+        signature: '',
+      }
+      attestation.signature = signEnvelope('agent-attestation', attestation, machine.privateKey)
+      return { version: HUB_NETWORK_WIRE_VERSION, name, protocol: 'tcp' as const, target: attestation.target, policy, attestation }
+    }
+    api.handleSharesReplace([share('web', 8080, { mode: 'hub' }), share('admin', 9000, { mode: 'private' })], {} as never, serviceState)
+
+    // A member that isn't an owner opens the hub's port and the share everyone may open, not the private one
+    const phone = makeKey()
+    const phoneState = state(phone)
+    ;(api as unknown as { registerAuthenticatedProfile(profile: unknown, state: State): unknown })
+      .registerAuthenticatedProfile(bind('wg-phone'), phoneState)
+    const grant = (await api.links(phoneState)).grants[0]!
+    expect(grant.aToB).toEqual([{ protocol: 'tcp', port: 1997 }, { protocol: 'tcp', port: 8080 }])
+    // An owner opens both, in a grant of its own
+    const ownerPhone = owner()
+    const ownerState = state(ownerPhone)
+    await api.bindAgent(bind('wg-owner'), {} as never, ownerState)
+    expect((await api.links(ownerState)).grants[0]!.aToB.map(({ port }) => port)).toEqual([1997, 8080, 9000])
+
+    // Once the service stops sharing, the member's next grant closes the port again
+    api.handleSharesReplace([], {} as never, serviceState)
+    const closed = (await api.links(phoneState)).grants[0]!
+    expect(closed.aToB).toEqual([{ protocol: 'tcp', port: 1997 }])
+    expect(closed.grantId).not.toBe(grant.grantId)
   })
 })

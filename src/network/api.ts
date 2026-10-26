@@ -6,6 +6,7 @@ import type {
   AgentProfile,
   ConnectionGrant,
   PeerLinkGrant,
+  PeerLinkPort,
   PeerLinks,
   NetworkPolicy,
   HubNetworkMessage,
@@ -627,7 +628,7 @@ export class NetworkAPI {
     const caller = this.authenticatedProfile(state)
     const host = this.hubHostProfile()
     const grants: PeerLinkGrant[] = []
-    if (host && host.key !== caller.key) grants.push(await this.peerLinkGrant('hub', caller, host))
+    if (host && host.key !== caller.key) grants.push(await this.peerLinkGrant('hub', caller, host, this.hostSharePorts(host, state)))
     const { hubKey, hubNetworkId } = this.registry.getIdentity()
     return {
       version: HUB_NETWORK_WIRE_VERSION,
@@ -646,13 +647,28 @@ export class NetworkAPI {
   }
 
   /**
-   * The signed `hub` grant between a member and the hub's machine: the member routes the machine's overlay addresses
-   * through it and may open the hub's port, the machine routes the member's addresses back. Reused until half of its
-   * lifetime has passed.
+   * The ports of the shares the hub's machine fronts that the caller may open, besides the hub's: a service's web UI
+   * on that machine is reached through the same link
    */
-  private async peerLinkGrant(purpose: 'hub', member: AgentProfile, host: AgentProfile): Promise<PeerLinkGrant> {
+  private hostSharePorts(host: AgentProfile, state: State): PeerLinkPort[] {
+    const ports = new Map<string, PeerLinkPort>([[`tcp/${this.hubPort}`, { protocol: 'tcp', port: this.hubPort }]])
+    this.agents.providers.forEach((provider: LiveProvider) => {
+      if (provider.key !== host.key) return
+      const resource = this.registry.getResource(provider.resourceId)
+      if (!resource || !this.canAccessShare(resource, state)) return
+      ports.set(`${provider.protocol}/${provider.port}`, { protocol: provider.protocol, port: provider.port })
+    })
+    return [...ports.values()].sort((a, b) => a.port - b.port || a.protocol.localeCompare(b.protocol))
+  }
+
+  /**
+   * The signed `hub` grant between a member and the hub's machine: the member routes the machine's overlay addresses
+   * through it and may open `ports` there (the hub's and its shares'), the machine routes the member's addresses back.
+   * Reused until half of its lifetime has passed.
+   */
+  private async peerLinkGrant(purpose: 'hub', member: AgentProfile, host: AgentProfile, ports: PeerLinkPort[]): Promise<PeerLinkGrant> {
     const cacheKey = [purpose, member.key, member.wireGuardKey, host.key, host.wireGuardKey,
-      ...member.overlayAddresses, ...host.overlayAddresses, String(this.hubPort)].join('\0')
+      ...member.overlayAddresses, ...host.overlayAddresses, ...ports.map(({ protocol, port }) => `${protocol}/${port}`)].join('\0')
     const cached = this.peerLinkGrants.get(cacheKey)
     if (cached && Date.parse(cached.expiresAt) - Date.now() > PEER_LINK_LIFETIME_MS / 2) return cached
     const { hubKey, hubNetworkId } = this.registry.getIdentity()
@@ -673,7 +689,7 @@ export class NetworkAPI {
       b: side(host),
       aViaB: host.overlayAddresses.map(hostRoute),
       bViaA: member.overlayAddresses.map(hostRoute),
-      aToB: [{ protocol: 'tcp', port: this.hubPort }],
+      aToB: ports,
       bToA: [],
       issuedAt: new Date(now).toISOString(),
       expiresAt: new Date(now + PEER_LINK_LIFETIME_MS).toISOString(),
