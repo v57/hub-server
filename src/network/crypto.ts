@@ -79,7 +79,8 @@ export function verifyEnvelope(
 
 export const CONNECTION_GRANT_MAX_LIFETIME_MS = 5 * 60 * 1000
 export const RENDEZVOUS_TICKET_MAX_LIFETIME_MS = 10 * 60 * 1000
-export const GATEWAY_GRANT_MAX_LIFETIME_MS = 5 * 60 * 1000
+/** As long as a peer link: a member keeps using a gateway while its app sleeps, and renews once half has passed */
+export const GATEWAY_GRANT_MAX_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000
 export const APPLE_APP_AGENT_READINESS_MAX_LIFETIME_MS = 30 * 1000
 export const DIRECT_BOOTSTRAP_MAX_LIFETIME_MS = 10 * 60 * 1000
 const MAX_CLOCK_SKEW_MS = 30 * 1000
