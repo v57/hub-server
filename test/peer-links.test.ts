@@ -40,9 +40,9 @@ describe('Peer links', () => {
   }
 
   /** The hub's machine: an owner bound as the Apple app agent */
-  const hubMachine = async () => {
+  const hubMachine = async (device?: string) => {
     const machine = owner()
-    const machineState = state(machine)
+    const machineState = { ...state(machine), ...(device ? { device } : {}) }
     await api.bindAgent(bind('wg-machine'), {} as never, machineState)
     const now = Date.now()
     const assertion: AppleAppAgentReadinessAssertion = {
@@ -131,5 +131,39 @@ describe('Peer links', () => {
     const closed = (await api.links(phoneState)).grants[0]!
     expect(closed.aToB).toEqual([{ protocol: 'tcp', port: 1997 }])
     expect(closed.grantId).not.toBe(grant.grantId)
+  })
+
+  test('the hub link opens the machine\'s SSH port for owners and callers granted network/ssh', async () => {
+    await hubMachine('mac')
+    api.deviceSSHPort = device => (device === 'mac' ? 22 : undefined)
+    const member = async (wireGuardKey: string, key = makeKey()) => {
+      const memberState = state(key)
+      ;(api as unknown as { registerAuthenticatedProfile(profile: unknown, state: State): unknown })
+        .registerAuthenticatedProfile(bind(wireGuardKey), memberState)
+      return { key, memberState }
+    }
+    const ports = async (memberState: State) => (await api.links(memberState)).grants[0]!.aToB.map(({ port }) => port)
+
+    // An owner reaches the SSH server, a member without a grant only the hub
+    const { memberState: ownerState } = await member('wg-owner', owner())
+    expect(await ports(ownerState)).toEqual([22, 1997])
+    const { key: phone, memberState: phoneState } = await member('wg-phone')
+    expect(await ports(phoneState)).toEqual([1997])
+    // An owner's grant on network/ssh opens it for that member
+    security.grants.add({ key: phone.key }, { path: 'network/ssh' }, 'test')
+    expect(await ports(phoneState)).toEqual([22, 1997])
+
+    // Once the machine stops reporting SSH, the port closes again
+    api.deviceSSHPort = () => undefined
+    expect(await ports(ownerState)).toEqual([1997])
+  })
+
+  test('a hub machine that isn\'t a device opens no SSH port', async () => {
+    await hubMachine()
+    api.deviceSSHPort = () => 22
+    const ownerPhone = owner()
+    const ownerState = state(ownerPhone)
+    await api.bindAgent(bind('wg-owner'), {} as never, ownerState)
+    expect((await api.links(ownerState)).grants[0]!.aToB).toEqual([{ protocol: 'tcp', port: 1997 }])
   })
 })

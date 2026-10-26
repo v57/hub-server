@@ -648,7 +648,7 @@ export class NetworkAPI {
 
   /**
    * The ports of the shares the hub's machine fronts that the caller may open, besides the hub's: a service's web UI
-   * on that machine is reached through the same link
+   * on that machine is reached through the same link. Its SSH server too, for callers that may sign in there
    */
   private hostSharePorts(host: AgentProfile, state: State): PeerLinkPort[] {
     const ports = new Map<string, PeerLinkPort>([[`tcp/${this.hubPort}`, { protocol: 'tcp', port: this.hubPort }]])
@@ -658,8 +658,22 @@ export class NetworkAPI {
       if (!resource || !this.canAccessShare(resource, state)) return
       ports.set(`${provider.protocol}/${provider.port}`, { protocol: provider.protocol, port: provider.port })
     })
+    const sshPort = host.device ? this.deviceSSHPort?.(host.device) : undefined
+    if (sshPort && this.canUseHostSSH(state)) ports.set(`tcp/${sshPort}`, { protocol: 'tcp', port: sshPort })
     return [...ports.values()].sort((a, b) => a.port - b.port || a.protocol.localeCompare(b.protocol))
   }
+
+  /**
+   * SSH to the hub's machine (the port its device reports in `capabilities.ssh`): owners, and callers an owner granted
+   * the path `network/ssh`. The SSH server still signs them in on its own
+   */
+  private canUseHostSSH(state: State): boolean {
+    if (!state.key) return false
+    return this.security.isOwner(state) || this.security.grants.allowsPath(this.security.caller(state), 'network/ssh')
+  }
+
+  /** The SSH port a device reports in `capabilities.ssh`, set by the hub */
+  deviceSSHPort: ((device: string) => number | undefined) | undefined
 
   /**
    * The signed `hub` grant between a member and the hub's machine: the member routes the machine's overlay addresses

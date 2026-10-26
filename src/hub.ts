@@ -154,6 +154,11 @@ export class Hub {
       if (state.certificate) this.devices.approve(state.certificate.deviceId)
     }
     networkAPI.deviceLabel = id => this.devices.registry.device(id)?.name
+    networkAPI.deviceSSHPort = id => {
+      const port = (this.devices.registry.device(id)?.capabilities?.ssh as { port?: unknown } | undefined)?.port
+      return Number.isInteger(port) && (port as number) > 0 && (port as number) < 65536 ? (port as number) : undefined
+    }
+    this.devices.onDescribed = () => networkAPI.onStateChanged?.()
     networkAPI.coordinator = () => this.hubNetNode.value
     const port = listenPort(address)
     if (port) networkAPI.hubPort = port

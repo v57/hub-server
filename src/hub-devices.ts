@@ -57,6 +57,8 @@ export class HubDevices {
   networkState?: (id: string) => 'online' | 'offline' | undefined
   /** Overlay address and DNS name of a device member, from Hub Network */
   overlay?: (id: string) => { address: string; authority: string } | undefined
+  /** A device's reporter described it: Hub Network reopens links for its SSH port */
+  onDescribed?: (id: string) => void
   /** Connections that asked for the reporter role, oldest first; the first attached one of a device reports */
   private reporterCandidates: State[] = []
   /** Latest live data per device, in memory only */
@@ -259,6 +261,7 @@ export class HubDevices {
       arch: arch as string | undefined,
       capabilities: capabilities as Record<string, unknown> | undefined,
     })
+    this.onDescribed?.(id)
   }
 
   /** `ssh.hostKey` and every `ssh.hostKeys` entry must carry the device's signature over `ssh1:<hostKey>` */
