@@ -772,11 +772,10 @@ export class NetworkAPI {
 
   listGatewayRevocations(state: State): GatewayRevocation[] {
     if (!state.key) return []
-    const profile = this.agents.getProfile(state.key)
-    if (!profile && !this.security.isOwner(state)) return []
+    if (!this.security.isOwner(state) && !this.gatewayClient(state)) return []
     return [...this.gatewayRevocations.values()].filter(revocation =>
       this.security.isOwner(state)
-      || revocation.gatewayKey === profile?.key
+      || revocation.gatewayKey === state.key
       || this.gatewayGrantAgents.get(revocation.gatewayKey)?.has(state.key!),
     )
   }
@@ -793,7 +792,8 @@ export class NetworkAPI {
     requested: { ipv4: boolean; ipv6: boolean; dns: boolean },
     state: State,
   ): Promise<GatewayGrant> {
-    const client = this.authenticatedProfile(state)
+    const client = this.gatewayClient(state)
+    if (!client) throw networkError('unauthorized', 'agent profile not registered', false)
     if (client.key !== clientKey || client.wireGuardKey !== clientWireGuardKey) {
       throw networkError('gateway_not_authorized', 'client binding does not match authenticated profile', false)
     }
@@ -847,7 +847,23 @@ export class NetworkAPI {
   }
 
   private canUseGatewayAPI(state: State): boolean {
-    return !!state.key && (this.security.isOwner(state) || !!this.agents.getProfile(state.key))
+    return !!state.key && (this.security.isOwner(state) || !!this.gatewayClient(state))
+  }
+
+  /**
+   * The caller as a gateway client: its registered profile, or the member its device (or key) stays while the hub has
+   * no profile for it, so a member whose app reconnected without registering again still uses a gateway. The member
+   * must be the caller's own: the same agent key.
+   */
+  private gatewayClient(state: State): { key: string; wireGuardKey: string } | undefined {
+    if (!state.key) return undefined
+    const profile = this.agents.getProfile(state.key)
+    if (profile) return { key: profile.key, wireGuardKey: profile.wireGuardKey }
+    const device = state.device ?? state.certificate?.deviceId
+    const members = this.registry.data.members
+    const member = (device ? members[deviceMemberKey(device)] : undefined) ?? members[state.key]
+    if (!member || (member.key ?? state.key) !== state.key) return undefined
+    return { key: state.key, wireGuardKey: member.wireGuardKey }
   }
 
   private revokeGateway(key: string, reason: string): GatewayRevocation {
@@ -1114,6 +1130,8 @@ export class NetworkAPI {
 
     const visibleKeys = new Set(this.listVisibleProviders(state).map(provider => provider.key))
     if (state.key && this.agents.getProfile(state.key)) visibleKeys.add(state.key)
+    // A device that shares its internet is listed for the members who may use it
+    if (this.canUseGatewayAPI(state)) for (const key of this.gateways.keys()) visibleKeys.add(key)
 
     // A caller only learns about agents serving resources it can see. Tunnel
     // keys remain available through signed grants, not broad discovery.

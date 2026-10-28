@@ -188,4 +188,32 @@ describe('Hub Network members by device', () => {
     expect(share(state(service, deviceB))).toThrow(expect.objectContaining({ code: 'share_device_mismatch' }))
     expect(share(state(service, deviceA))()[0]).toMatchObject({ protocol: 'tcp', port: 9000 })
   })
+
+  test('a member finds the device sharing its internet and gets a grant for it, also once its profile is dropped', async () => {
+    const mac = owner()
+    await api.bindAgent(bind('wg-mac'), {} as never, state(mac, deviceA))
+    api.advertiseGateway({
+      version: HUB_NETWORK_WIRE_VERSION, capability: 'internet-gateway-v1', ipv4: true, ipv6: false, dns: true, metered: false,
+      updatedAt: new Date().toISOString(),
+    }, '192.168.0.10:51820', state(mac, deviceA))
+    const air = makeKey()
+    api.registry.allocateAddresses(`device:${deviceB}`)
+    await api.bindAgent({ ...bind('wg-air'), bindingKind: 'join' }, {} as never, state(air, deviceB))
+    const grant = (caller: State, key: string, wireGuardKey: string) =>
+      api.issueGatewayGrant(key, wireGuardKey, mac.key, { ipv4: true, ipv6: false, dns: true }, caller)
+    for (const dropped of [false, true]) {
+      if (dropped) api.agents.unregisterProfile(air.key)
+      const caller = state(air, deviceB)
+      expect(api.listGateways(caller).map(gateway => gateway.key)).toEqual([mac.key])
+      expect(api.listAgents(caller).some(profile => profile.key === mac.key)).toBe(true)
+      expect((await grant(caller, air.key, 'wg-air')).clientWireGuardKey).toBe('wg-air')
+      await expect(grant(caller, air.key, 'wg-other')).rejects.toMatchObject({ code: 'gateway_not_authorized' })
+    }
+    // Another key on that device isn't its member, nor is a stranger
+    for (const other of [state(makeKey(), deviceB), state(makeKey())]) {
+      expect(api.listGateways(other)).toEqual([])
+      expect(api.listAgents(other).some(profile => profile.key === mac.key)).toBe(false)
+      await expect(grant(other, other.key!, 'wg-air')).rejects.toMatchObject({ code: 'unauthorized' })
+    }
+  })
 })
