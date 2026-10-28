@@ -1130,14 +1130,16 @@ export class NetworkAPI {
 
     const visibleKeys = new Set(this.listVisibleProviders(state).map(provider => provider.key))
     if (state.key && this.agents.getProfile(state.key)) visibleKeys.add(state.key)
-    // A device that shares its internet is listed for the members who may use it
-    if (this.canUseGatewayAPI(state)) for (const key of this.gateways.keys()) visibleKeys.add(key)
+    // A device that shares its internet is listed for the members who may use it, with the WireGuard key its gateway
+    // status already gives them: their app matches the two by it
+    const gatewayKeys = new Set(this.canUseGatewayAPI(state) ? this.gateways.keys() : [])
+    for (const key of gatewayKeys) visibleKeys.add(key)
 
     // A caller only learns about agents serving resources it can see. Tunnel
     // keys remain available through signed grants, not broad discovery.
     return this.agents.listProfiles().filter(profile => visibleKeys.has(profile.key)).map(p => ({
       ...p,
-      wireGuardKey: '',
+      wireGuardKey: gatewayKeys.has(p.key) ? p.wireGuardKey : '',
     }))
   }
 

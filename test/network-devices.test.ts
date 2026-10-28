@@ -205,7 +205,7 @@ describe('Hub Network members by device', () => {
       if (dropped) api.agents.unregisterProfile(air.key)
       const caller = state(air, deviceB)
       expect(api.listGateways(caller).map(gateway => gateway.key)).toEqual([mac.key])
-      expect(api.listAgents(caller).some(profile => profile.key === mac.key)).toBe(true)
+      expect(api.listAgents(caller).find(profile => profile.key === mac.key)?.wireGuardKey).toBe('wg-mac')
       expect((await grant(caller, air.key, 'wg-air')).clientWireGuardKey).toBe('wg-air')
       await expect(grant(caller, air.key, 'wg-other')).rejects.toMatchObject({ code: 'gateway_not_authorized' })
     }
