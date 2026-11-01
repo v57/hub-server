@@ -179,6 +179,111 @@ describe('Peer links', () => {
     expect(closed.grantId).not.toBe(grant.grantId)
   })
 
+  test('members get a share link to each other member fronting a share they may open', async () => {
+    const { machine, machineState } = await hubMachine()
+    const member = (wireGuardKey: string, key = makeKey()) => {
+      const memberState = state(key)
+      ;(api as unknown as { registerAuthenticatedProfile(profile: unknown, state: State): unknown })
+        .registerAuthenticatedProfile(bind(wireGuardKey), memberState)
+      return { key, memberState }
+    }
+    const shares = (device: TestKey, list: [string, number, NetworkPolicy][]) => list.map(([name, port, policy]) => {
+      const now = Date.now()
+      const attestation: AgentAttestation = {
+        version: HUB_NETWORK_WIRE_VERSION,
+        attestationId: crypto.randomUUID(),
+        serviceKey: device.key,
+        key: device.key,
+        shareName: name,
+        protocol: 'tcp',
+        target: { host: '127.0.0.1', port },
+        issuedAt: new Date(now).toISOString(),
+        expiresAt: new Date(now + 60_000).toISOString(),
+        signature: '',
+      }
+      attestation.signature = signEnvelope('agent-attestation', attestation, device.privateKey)
+      return { version: HUB_NETWORK_WIRE_VERSION, name, protocol: 'tcp' as const, target: attestation.target, policy, attestation }
+    })
+    const shareGrants = async (memberState: State) =>
+      (await api.links(memberState)).grants.filter(({ purpose }) => purpose === 'share')
+
+    const { key: phone, memberState: phoneState } = member('wg-phone')
+    const { key: tablet, memberState: tabletState } = member('wg-tablet')
+    expect(await shareGrants(tabletState)).toEqual([])
+    // A camera on the phone everyone may open, and notes only its owner may
+    api.handleSharesReplace(shares(phone, [['Camera: Phone', 50000, { mode: 'hub' }], ['notes', 9000, { mode: 'private' }]]), {} as never, phoneState)
+
+    // The tablet opens the camera's port on the phone and nothing comes back
+    const [grant, ...others] = await shareGrants(tabletState)
+    expect(others).toEqual([])
+    expect(grant).toMatchObject({
+      purpose: 'share',
+      a: { key: tablet.key, wireGuardKey: 'wg-tablet' },
+      b: { key: phone.key, wireGuardKey: 'wg-phone' },
+      aToB: [{ protocol: 'tcp', port: 50000 }],
+      bToA: [],
+    })
+    expect(grant!.aViaB).toEqual(grant!.b.addresses.map(hostRoute))
+    expect(grant!.bViaA).toEqual(grant!.a.addresses.map(hostRoute))
+    expect(verifyEnvelope('peer-link', grant!, createPublicKey({ key: Buffer.from(hub.key, 'base64'), format: 'der', type: 'spki' }))).toBeTrue()
+    expect((await shareGrants(tabletState))[0]!.grantId).toBe(grant!.grantId)
+    // An owner opens both; the phone has no share link to itself; the machine reaches the phone through its hub link
+    const { memberState: ownerState } = member('wg-owner', owner())
+    expect((await shareGrants(ownerState))[0]!.aToB.map(({ port }) => port)).toEqual([9000, 50000])
+    expect(await shareGrants(phoneState)).toEqual([])
+    expect(await api.links(machineState)).toMatchObject({ grants: [] })
+
+    // The machine's own shares stay on the hub link
+    api.handleSharesReplace(shares(machine, [['web', 8080, { mode: 'hub' }]]), {} as never, machineState)
+    expect((await shareGrants(tabletState)).map(({ b }) => b.key)).toEqual([phone.key])
+
+    // Both members fronting shares: each gets its own link to the other
+    api.handleSharesReplace(shares(tablet, [['Camera: Tablet', 50001, { mode: 'hub' }]]), {} as never, tabletState)
+    expect((await shareGrants(phoneState)).map(({ a, b, aToB }) => [a.key, b.key, aToB])).toEqual([
+      [phone.key, tablet.key, [{ protocol: 'tcp', port: 50001 }]],
+    ])
+
+    // Once the phone stops sharing, the tablet's link to it is gone
+    api.handleSharesReplace([], {} as never, phoneState)
+    expect(await shareGrants(tabletState)).toEqual([])
+  })
+
+  test('a member gets at most 15 share links', async () => {
+    await hubMachine()
+    const register = (wireGuardKey: string) => {
+      const key = makeKey()
+      const memberState = state(key)
+      ;(api as unknown as { registerAuthenticatedProfile(profile: unknown, state: State): unknown })
+        .registerAuthenticatedProfile(bind(wireGuardKey), memberState)
+      return { key, memberState }
+    }
+    const viewer = register('wg-viewer')
+    for (let index = 0; index < 20; index++) {
+      const camera = register(`wg-camera-${index}`)
+      const now = Date.now()
+      const attestation: AgentAttestation = {
+        version: HUB_NETWORK_WIRE_VERSION,
+        attestationId: crypto.randomUUID(),
+        serviceKey: camera.key.key,
+        key: camera.key.key,
+        shareName: `Camera ${index}`,
+        protocol: 'tcp',
+        target: { host: '127.0.0.1', port: 50000 },
+        issuedAt: new Date(now).toISOString(),
+        expiresAt: new Date(now + 60_000).toISOString(),
+        signature: '',
+      }
+      attestation.signature = signEnvelope('agent-attestation', attestation, camera.key.privateKey)
+      api.handleSharesReplace([{
+        version: HUB_NETWORK_WIRE_VERSION, name: attestation.shareName, protocol: 'tcp', target: attestation.target,
+        policy: { mode: 'hub' }, attestation,
+      }], {} as never, camera.memberState)
+    }
+    const grants = (await api.links(viewer.memberState)).grants
+    expect(grants.filter(({ purpose }) => purpose === 'hub').length).toBe(1)
+    expect(grants.filter(({ purpose }) => purpose === 'share').length).toBe(15)
+  })
+
   test('the hub link opens the machine\'s SSH port for owners and callers granted network/ssh', async () => {
     await hubMachine('mac')
     api.deviceSSHPort = device => (device === 'mac' ? 22 : undefined)

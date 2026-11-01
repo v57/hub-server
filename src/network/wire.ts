@@ -208,7 +208,8 @@ export interface PeerLinkPort {
 
 /**
  * A hub-signed link between two devices (hub-net-node's PROTOCOL.md, "Peer links"). `hub` links a member (`a`) to the
- * hub's machine (`b`): the member routes `aViaB` through it and may open `aToB` on it.
+ * hub's machine (`b`): the member routes `aViaB` through it and may open `aToB` on it. `share` links a member (`a`) to
+ * another member fronting shares it may open (`b`), opening their ports (`aToB`) and nothing back.
  */
 export interface PeerLinkGrant extends Versioned {
   grantId: string
