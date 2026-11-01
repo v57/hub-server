@@ -41,7 +41,7 @@ import { stableResourceId, canonicalAuthority, deviceAuthority } from './foundat
 import type { Sender } from 'channel/server'
 import type { State } from '../hub'
 import { publicKey, signChallenge } from '../keychain'
-import { Security } from '../security'
+import { Security, type Principal } from '../security'
 import type { Grant } from '../grants'
 import { createPublicKey } from 'crypto'
 import { LocalAgentBindingStore } from './local-agent'
@@ -621,14 +621,17 @@ export class NetworkAPI {
   /**
    * `network/links`: the caller's peer link grants (hub-net-node's PROTOCOL.md, "Peer links"). Each member gets a
    * `hub` link to the hub's machine, so it reaches the hub over a direct WireGuard path the coordinator introduces, also
-   * from a network where it can't reach the hub itself. Devices check a grant against the hub key they pinned and
-   * decide on their own; the coordinator only forwards it.
+   * from a network where it can't reach the hub itself. The machine reaches the member's own shares it may open through
+   * the same link. Devices check a grant against the hub key they pinned and decide on their own; the coordinator only
+   * forwards it.
    */
   async links(state: State): Promise<PeerLinks> {
     const caller = this.authenticatedProfile(state)
     const host = this.hubHostProfile()
     const grants: PeerLinkGrant[] = []
-    if (host && host.key !== caller.key) grants.push(await this.peerLinkGrant('hub', caller, host, this.hostSharePorts(host, state)))
+    if (host && host.key !== caller.key) {
+      grants.push(await this.peerLinkGrant('hub', caller, host, this.hostSharePorts(host, state), this.memberSharePorts(caller, host)))
+    }
     const { hubKey, hubNetworkId } = this.registry.getIdentity()
     return {
       version: HUB_NETWORK_WIRE_VERSION,
@@ -664,6 +667,22 @@ export class NetworkAPI {
   }
 
   /**
+   * The ports of the shares the member's device fronts that the hub's machine may open: a camera on a phone, watched
+   * from the hub's Mac. Other members don't reach them, as they have no link to the member
+   */
+  private memberSharePorts(member: AgentProfile, host: AgentProfile): PeerLinkPort[] {
+    const ports = new Map<string, PeerLinkPort>()
+    const machine = { key: host.key, device: host.device }
+    this.agents.providers.forEach((provider: LiveProvider) => {
+      if (provider.key !== member.key) return
+      const resource = this.registry.getResource(provider.resourceId)
+      if (!resource || !this.canAccessShare(resource, machine)) return
+      ports.set(`${provider.protocol}/${provider.port}`, { protocol: provider.protocol, port: provider.port })
+    })
+    return [...ports.values()].sort((a, b) => a.port - b.port || a.protocol.localeCompare(b.protocol))
+  }
+
+  /**
    * SSH to the hub's machine (the port its device reports in `capabilities.ssh`): owners, and callers an owner granted
    * the path `network/ssh`. The SSH server still signs them in on its own
    */
@@ -677,12 +696,15 @@ export class NetworkAPI {
 
   /**
    * The signed `hub` grant between a member and the hub's machine: the member routes the machine's overlay addresses
-   * through it and may open `ports` there (the hub's and its shares'), the machine routes the member's addresses back.
-   * Reused until half of its lifetime has passed.
+   * through it and may open `ports` there (the hub's and its shares'), the machine routes the member's addresses back
+   * and may open `back` on the member (its shares). Reused until half of its lifetime has passed.
    */
-  private async peerLinkGrant(purpose: 'hub', member: AgentProfile, host: AgentProfile, ports: PeerLinkPort[]): Promise<PeerLinkGrant> {
+  private async peerLinkGrant(
+    purpose: 'hub', member: AgentProfile, host: AgentProfile, ports: PeerLinkPort[], back: PeerLinkPort[],
+  ): Promise<PeerLinkGrant> {
     const cacheKey = [purpose, member.key, member.wireGuardKey, host.key, host.wireGuardKey,
-      ...member.overlayAddresses, ...host.overlayAddresses, ...ports.map(({ protocol, port }) => `${protocol}/${port}`)].join('\0')
+      ...member.overlayAddresses, ...host.overlayAddresses, ...ports.map(({ protocol, port }) => `${protocol}/${port}`),
+      ...back.map(({ protocol, port }) => `<${protocol}/${port}`)].join('\0')
     const cached = this.peerLinkGrants.get(cacheKey)
     if (cached && Date.parse(cached.expiresAt) - Date.now() > PEER_LINK_LIFETIME_MS / 2) return cached
     const { hubKey, hubNetworkId } = this.registry.getIdentity()
@@ -704,7 +726,7 @@ export class NetworkAPI {
       aViaB: host.overlayAddresses.map(hostRoute),
       bViaA: member.overlayAddresses.map(hostRoute),
       aToB: ports,
-      bToA: [],
+      bToA: back,
       issuedAt: new Date(now).toISOString(),
       expiresAt: new Date(now + PEER_LINK_LIFETIME_MS).toISOString(),
       signature: '',
@@ -1216,10 +1238,10 @@ export class NetworkAPI {
    * Share access is a grant (protocol.md section 9): owners and the share's own service always, unless the share
    * is disabled; anyone else needs a `{ share }` grant for their key, device, groups or everyone.
    */
-  private canAccessShare(resource: NetworkResource, state: State): boolean {
-    if (resource.policy.mode === 'disabled' || !state.key) return false
-    if (this.security.isOwner(state) || resource.ownerKey === state.key) return true
-    return this.security.grants.allowsShare(this.security.caller(state), resource.resourceId)
+  private canAccessShare(resource: NetworkResource, who: Principal): boolean {
+    if (resource.policy.mode === 'disabled' || !who.key) return false
+    if (this.security.isOwner(who) || resource.ownerKey === who.key) return true
+    return this.security.grants.allowsShare(this.security.caller(who), resource.resourceId)
   }
 
   /** Grants a share policy stands for: hub → everyone, group → the group, keys → each key, private → none */
