@@ -717,6 +717,9 @@ export class NetworkAPI {
    * SSH to the hub's machine (the port its device reports in `capabilities.ssh`): owners, and callers an owner granted
    * the path `network/ssh`. The SSH server still signs them in on its own
    */
+  canSignInToHost(state: State): boolean {
+    return this.canUseHostSSH(state)
+  }
   private canUseHostSSH(state: State): boolean {
     if (!state.key) return false
     return this.security.isOwner(state) || this.security.grants.allowsPath(this.security.caller(state), 'network/ssh')
@@ -1087,7 +1090,7 @@ export class NetworkAPI {
         member: key,
         ...(member.device ? { device: member.device } : {}),
         wireGuardKey: member.wireGuardKey,
-        name: member.name,
+        name: this.profileName(member.device, member.name),
         platform: member.platform,
         overlayAddresses: addresses,
         connectedAt: member.lastSeen,
@@ -1096,6 +1099,7 @@ export class NetworkAPI {
       }))
     const online = connected.map(profile => ({
       ...profile,
+      name: this.profileName(this.agentDevices.get(profile.key), profile.name),
       online: true,
       ...this.deviceFields(this.agentDevices.get(profile.key), profile.name),
     }))
@@ -1120,8 +1124,40 @@ export class NetworkAPI {
     return { address: addresses[0], authority: this.deviceAuthority(device, this.registry.data.members[deviceMemberKey(device)]?.name) }
   }
 
-  /** Device names for member DNS names, set by the hub */
+  /** Device names for member DNS names and profiles, set by the hub */
   deviceLabel: ((device: string) => string | undefined) | undefined
+  /** The device a service key runs on, set by the hub */
+  serviceDevice: ((key: string) => string | undefined) | undefined
+
+  /**
+   * The devices a member's directory shows for Hub Network: those fronting a share the caller may open, with the shares'
+   * ports, and those offering it their internet.
+   */
+  devicesSharedWith(state: State): Map<string, Set<number>> {
+    const devices = new Map<string, Set<number>>()
+    const ports = (device: string) => devices.get(device) ?? devices.set(device, new Set()).get(device)!
+    for (const resource of Object.values(this.registry.data.resources)) {
+      if (!this.canAccessShare(resource, state)) continue
+      const placed = this.serviceDevice?.(resource.ownerKey)
+      if (placed) ports(placed)
+      for (const provider of this.agents.getProviders(resource.resourceId)) {
+        const device = this.agentDevices.get(provider.key)
+        if (device) ports(device).add(provider.port)
+      }
+    }
+    if (this.canUseGatewayAPI(state)) {
+      for (const key of this.gateways.keys()) {
+        const device = this.agentDevices.get(key)
+        if (device) ports(device)
+      }
+    }
+    return devices
+  }
+
+  /** A profile's name: a device's is the one the hub gave it, not what its agent says */
+  private profileName(device: string | undefined, name: string | undefined): string | undefined {
+    return (device && this.deviceLabel?.(device)) || name
+  }
   onRevokedDevicesChanged: (() => void) | undefined
 
   /** A member by its device or, for legacy agents, by its key */
@@ -1193,6 +1229,7 @@ export class NetworkAPI {
     // keys remain available through signed grants, not broad discovery.
     return this.agents.listProfiles().filter(profile => visibleKeys.has(profile.key)).map(p => ({
       ...p,
+      name: this.profileName(this.agentDevices.get(p.key), p.name),
       wireGuardKey: gatewayKeys.has(p.key) ? p.wireGuardKey : '',
     }))
   }

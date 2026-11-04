@@ -29,6 +29,7 @@ describe('device reporter, data and selection', () => {
     security.addOwner(device.key)
     security.setMode({ mode: 'default-deny' })
     hub = new Hub(port)
+    hub.devices.gate.interval = 0
     await hub.ready
     owners = client(owner)
   })

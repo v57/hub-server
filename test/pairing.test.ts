@@ -236,6 +236,7 @@ describe('pairing on the hub', () => {
   beforeAll(async () => {
     security.setMode({ mode: 'default-deny' })
     hub = new Hub(port)
+    hub.devices.gate.interval = 0
     await hub.ready
     hub.pairing.minDuration = 0
   })

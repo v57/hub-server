@@ -31,6 +31,7 @@ describe('Hub Network on the hub', () => {
   beforeAll(async () => {
     security.addOwner(owner.key)
     hub = new Hub(port)
+    hub.devices.gate.interval = 0
     await hub.ready
     owners = client(owner)
   })
@@ -58,7 +59,8 @@ describe('Hub Network on the hub', () => {
     const devices = await until<any[]>(owners, 'hub/devices', list => list.some(d => d.id === lostId && d.network === 'online'))
     const listed = devices.find(d => d.id === lostId)
     expect(listed.overlay.address).toMatch(/^100\./)
-    expect(listed.overlay.authority).toMatch(/^agent-box-[a-z2-7]{16}\.v1-[a-z2-7]{16}\.hub\.invalid$/)
+    // Both agents ask for the same name, and the second gets a suffix
+    expect(listed.overlay.authority).toMatch(/^agent-box(-2)?-[a-z2-7]{16}\.v1-[a-z2-7]{16}\.hub\.invalid$/)
 
     await owners.sender.send('hub/device/revoke', { id: lostId })
     const revoked = await until<any[]>(other, 'network/devices/revoked', list => list.length > 0)

@@ -5,15 +5,19 @@ import { createPublicKey, verify } from 'node:crypto'
 import type { Hub, State } from './hub'
 import {
   DeviceRegistry,
+  RequestGate,
   hostName,
   hostPlatform,
   loadDeviceKey,
+  maxPendingDevices,
+  requestSource,
   verifyCertificate,
+  type Certificate,
   type PendingDevice,
   type StoredDevice,
 } from './devices'
 import { deviceId } from './devices'
-import type { Security } from './security'
+import type { Caller, Security } from './security'
 
 /** A device as `hub/devices` lists it (protocol.md section 6) */
 export interface Device {
@@ -32,6 +36,23 @@ export interface Device {
   lastSeen: string
   capabilities?: Record<string, unknown>
   services: { key: string; instance: string; name?: string; online: boolean; paths: string[] }[]
+  /** What the device's safety code covers: only for owners and the device itself */
+  codeValue?: string
+}
+
+/** `hub/device/request`: how a connection's device stands. No code before `codeValue` comes from the hub. */
+export interface DeviceRequest {
+  id: string
+  status: 'waiting' | 'pending' | 'approved'
+  name?: string
+  codeValue?: string
+}
+
+/** A request waiting for its turn, with the connection it came on */
+interface WaitingRequest {
+  deviceId: string
+  certificate: Certificate
+  state: State
 }
 
 /** What revoking or removing a device took away, for Hub Network */
@@ -49,8 +70,15 @@ export class HubDevices {
   registry = new DeviceRegistry()
   /** The device this hub runs on */
   selfId?: string
-  devicesState = new FreshState<Device[]>(() => this.list()).delay(0.1)
+  /** Who a connection's `hub/devices` is for: a merged hub's connection is that hub, never an owner */
+  private listCallers = new WeakMap<State, () => Caller>()
+  /** `hub/devices` per caller: each sees what's shared with it (protocol.md section 13) */
+  devicesState = new LazyStates<State, Device[]>(state => this.listFor(state)).dedupe('json')
   pendingState = new FreshState<PendingDevice[]>(() => this.registry.pending())
+  /** `hub/device/request` per connection */
+  requestState = new LazyStates<State, DeviceRequest>(state => this.request(state)).dedupe('json')
+  /** New requests, one a second */
+  gate = new RequestGate<WaitingRequest>(request => this.admit(request))
   /** Hub Network removes the member of a removed or revoked device */
   onRemoved?: (removal: DeviceRemoval) => void
   /** Network presence of a device, from Hub Network */
@@ -59,11 +87,23 @@ export class HubDevices {
   overlay?: (id: string) => { address: string; authority: string } | undefined
   /** A device's reporter described it: Hub Network reopens links for its SSH port */
   onDescribed?: (id: string) => void
+  /** Devices fronting a share this caller may open or offering it their internet, with the shares' ports, from Hub Network */
+  sharedWith?: (state: State) => Map<string, Set<number>>
+  /** Whether this caller may sign in to the SSH server of the hub's machine, from Hub Network */
+  canUseHostSSH?: (state: State) => boolean
+  /** The device of the hub's machine as Hub Network knows it, else the one the hub runs on */
+  hostDevice: () => string | undefined = () => this.selfId
   /** Connections that asked for the reporter role, oldest first; the first attached one of a device reports */
   private reporterCandidates: State[] = []
   /** Latest live data per device, in memory only */
   private liveData = new Map<string, Record<string, unknown>>()
-  liveDataState = new LazyStates<string, Record<string, unknown>>(id => this.liveData.get(id) ?? {})
+  /** `hub/devices/data` per connection and device, empty once the caller may not see it any more */
+  private liveDataStreams = new Map<string, { id: string; caller: () => Caller }>()
+  liveDataState = new LazyStates<string, Record<string, unknown>>(stream => {
+    const entry = this.liveDataStreams.get(stream)
+    if (!entry) return {}
+    return this.seesLiveData(entry.caller(), entry.id) ? (this.liveData.get(entry.id) ?? {}) : {}
+  }).dedupe('json')
 
   constructor(
     private hub: Hub,
@@ -75,6 +115,7 @@ export class HubDevices {
 
   /** Loads the registry and enrols the hub's own device, approved, with the hub key as its service */
   async load(hubKey: string | undefined) {
+    this.registry.hubKey = hubKey ?? ''
     await this.registry.load()
     // Lost tombstones would let revoked devices and keys back in
     if (this.registry.storage.corrupt) this.security.lockDown()
@@ -110,6 +151,12 @@ export class HubDevices {
       this.security.isOwner({ device: id }) ||
       (!!this.security.launcher && state.key === this.security.launcher) ||
       id === this.selfId
+    // A new request waits its turn; it holds nothing until then, and connects as a plain key
+    if (!approve && !this.registry.device(id)) {
+      state.certificate = certificate
+      this.gate.ask(requestSource(state.ip), { deviceId: id, certificate, state })
+      return
+    }
     const device = this.registry.seen(certificate, approve)
     if (!device) {
       console.log('Ignored certificate of revoked device', id)
@@ -118,6 +165,36 @@ export class HubDevices {
     state.certificate = certificate
     if (device.approved) this.attach(state)
     this.pendingState.setNeedsUpdate()
+  }
+
+  /** A new request's turn: it joins the pending list, pushing out the oldest once that is full */
+  private admit({ certificate }: WaitingRequest) {
+    if (this.registry.device(certificate.deviceId)) return
+    const pending = this.registry.pendingIds()
+    const online = new Set(Array.from(this.hub.connections, connection => connection.state.certificate?.deviceId))
+    while (pending.length >= maxPendingDevices) {
+      const index = Math.max(0, pending.findIndex(id => !online.has(id)))
+      const [oldest] = pending.splice(index, 1) as [string]
+      this.registry.remove(oldest)
+      // It asks again when it reconnects
+      for (const connection of this.connectionsOf(oldest)) connection.sender.stop()
+    }
+    this.registry.seen(certificate, false)
+    this.requestState.setNeedsUpdate()
+  }
+
+  /** Where a connection's device stands. A connection still without a place in line takes one. */
+  private request(state: State): DeviceRequest {
+    const certificate = state.certificate
+    if (!certificate) throw 'no device certificate'
+    const id = certificate.deviceId
+    const device = this.registry.device(id)
+    if (!device) {
+      this.gate.ask(requestSource(state.ip), { deviceId: id, certificate, state })
+      if (!this.registry.device(id)) return { id, status: 'waiting' }
+      return this.request(state)
+    }
+    return { id, status: device.approved ? 'approved' : 'pending', name: device.name, codeValue: this.registry.codeValue(device) }
   }
 
   /** Makes a connection with a certificate from an approved device a device connection */
@@ -133,11 +210,22 @@ export class HubDevices {
   setNeedsUpdate() {
     this.devicesState.setNeedsUpdate()
     this.pendingState.setNeedsUpdate()
+    this.requestState.setNeedsUpdate()
+    this.liveDataState.setNeedsUpdate()
+  }
+
+  /** Approves the device of a connection that proved itself otherwise (pairing, a Hub Network join), waiting or not */
+  approveConnection(state: State) {
+    const certificate = state.certificate
+    if (!certificate) return
+    if (!this.registry.device(certificate.deviceId)) this.registry.seen(certificate, false)
+    this.approve(certificate.deviceId)
   }
 
   /** Approves a pending device, also an owner's or a Hub Network joiner's, and attaches its open connections */
   approve(id: string): Device {
     this.registry.approve(id)
+    this.gate.forget(request => request.deviceId === id)
     for (const connection of this.connectionsOf(id)) this.attach(connection.state)
     this.hub.connectionsChanged()
     this.setNeedsUpdate()
@@ -194,6 +282,68 @@ export class HubDevices {
     return Object.entries(this.registry.data.devices).map(([id, device]) => this.encode(id, device))
   }
 
+  /** Owners and those an owner granted `hub/devices` itself see every device */
+  private seesEverything(caller: Caller): boolean {
+    return caller.owner || (!this.security.lockdown && this.security.granted(caller, 'hub/devices'))
+  }
+
+  /**
+   * A caller's own devices: the one it's attached to, the one its key runs on, and those of a person group it's in
+   * (protocol.md section 13).
+   */
+  private ownDevices(caller: Caller): Set<string> {
+    const own = new Set<string>()
+    const placed = (key: string | undefined) => key && this.registry.data.services[key]?.device
+    if (caller.device) own.add(caller.device.id)
+    if (caller.key && placed(caller.key)) own.add(placed(caller.key) as string)
+    for (const group of caller.groups) {
+      if (!this.security.group.isPerson(group)) continue
+      for (const member of this.security.members.members(group)) {
+        if (member.startsWith('device:')) own.add(member.slice('device:'.length))
+        else if (placed(member.slice('key:'.length))) own.add(placed(member.slice('key:'.length)) as string)
+      }
+    }
+    return own
+  }
+
+  /** `hub/devices` for one connection */
+  private listFor(state: State): Device[] {
+    const caller = this.listCallers.get(state)?.() ?? this.security.caller(state)
+    const everything = this.seesEverything(caller)
+    const own = everything ? new Set<string>() : this.ownDevices(caller)
+    const shared = everything ? new Map<string, Set<number>>() : (this.sharedWith?.(state) ?? new Map<string, Set<number>>())
+    const hostSSH = !everything && !!this.canUseHostSSH?.(state)
+    return Object.entries(this.registry.data.devices).flatMap(([id, device]) => {
+      if (everything) return [{ ...this.encode(id, device), codeValue: this.registry.codeValue(device) }]
+      if (!device.approved || device.revoked) return []
+      if (own.has(id)) return [{ ...this.encode(id, device), codeValue: this.registry.codeValue(device) }]
+      const entry = this.encodeShared(id, device, caller, shared.get(id), hostSSH && id === this.hostDevice())
+      return entry ? [entry] : []
+    })
+  }
+
+  /**
+   * A device someone else runs, as a member sees it: its identity and how to reach it, the services it may call, and its
+   * SSH details only where it may use them. Undefined while nothing on it is shared with the caller.
+   */
+  private encodeShared(id: string, device: StoredDevice, caller: Caller, ports: Set<number> | undefined, hostSSH: boolean): Device | undefined {
+    const full = this.encode(id, device)
+    const services = full.services.flatMap(service => {
+      const paths = service.paths.filter(path => this.security.granted(caller, path))
+      return paths.length ? [{ ...service, paths }] : []
+    })
+    if (!ports && !services.length && !hostSSH) return
+    const ssh = device.capabilities?.ssh as { port?: number } | undefined
+    const seesSSH = !!ssh && (hostSSH || (ssh.port !== undefined && !!ports?.has(ssh.port)))
+    const { os: _os, arch: _arch, parent: _parent, capabilities: _capabilities, ...visible } = full
+    return { ...visible, services, ...(seesSSH ? { capabilities: { ssh } } : {}) }
+  }
+
+  /** Live data stays with the device's own person, and owners */
+  private seesLiveData(caller: Caller, id: string): boolean {
+    return !!this.registry.device(id) && (this.seesEverything(caller) || this.ownDevices(caller).has(id))
+  }
+
   private encode(id: string, device: StoredDevice): Device {
     const attached = Array.from(this.hub.connections, c => c.state).filter(state => state.device === id)
     const services = Object.entries(this.registry.data.services)
@@ -231,6 +381,12 @@ export class HubDevices {
   disconnected(state: State) {
     const index = this.reporterCandidates.indexOf(state)
     if (index >= 0) this.reporterCandidates.splice(index, 1)
+    this.gate.forget(request => request.state === state)
+    for (const stream of this.liveDataStreams.keys()) {
+      if (stream.startsWith(`${state.id}\n`)) this.liveDataStreams.delete(stream)
+    }
+    // Another connection of the same device takes its place in line
+    this.requestState.setNeedsUpdate()
   }
   /** The connection that reports for a device: the first connected candidate attached to it */
   reporter(id: string): State | undefined {
@@ -286,20 +442,34 @@ export class HubDevices {
     if (!body || typeof body !== 'object' || Array.isArray(body)) throw 'invalid data'
     if (JSON.stringify(body).length > 16384) throw 'data too large'
     this.liveData.set(id, body as Record<string, unknown>)
-    this.liveDataState.setNeedsUpdate(id)
+    for (const [stream, entry] of this.liveDataStreams) {
+      if (entry.id === id) this.liveDataState.setNeedsUpdate(stream)
+    }
   }
 
   register(channel: Channel<State>) {
     channel
       .post('hub/device/describe', ({ body, state }) => this.describeSelf(state, body))
       .post('hub/device/data', ({ body, state }) => this.reportData(state, body))
-      .stream('hub/devices/data', ({ body }) => {
+      .stream('hub/devices/data', ({ body, state, sender, context }) => {
         const id = body?.id
-        if (typeof id !== 'string' || !this.registry.device(id)) throw 'device not found'
-        return this.liveDataState.makeIterator(id)
+        const caller = () => this.hub.caller(state, sender, context)
+        // The same answer for a device that's hidden as for one that doesn't exist
+        if (typeof id !== 'string' || !this.seesLiveData(caller(), id)) throw 'device not found'
+        const stream = `${state.id}\n${id}`
+        this.liveDataStreams.set(stream, { id, caller })
+        return this.liveDataState.makeIterator(stream)
+      })
+      .stream('hub/device/request', ({ state }) => {
+        if (!state.certificate) throw 'no device certificate'
+        return this.requestState.makeIterator(state)
       })
     channel
-      .stream('hub/devices', () => this.devicesState.makeIterator())
+      .stream('hub/devices', ({ state, sender, context }) => {
+        this.listCallers.set(state, () => this.hub.caller(state, sender, context))
+        this.devicesState.state(state).delay(0.1)
+        return this.devicesState.makeIterator(state)
+      })
       .stream('hub/devices/pending', () => this.pendingState.makeIterator())
       .post('hub/device/approve', ({ body }) => this.approve(body?.id))
       .post('hub/device/rename', ({ body }) => this.rename(body?.id, body?.name))

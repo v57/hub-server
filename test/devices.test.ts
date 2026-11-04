@@ -7,9 +7,11 @@ import { certificate, connect, first, freePort, makeKey, token, until, waitFor, 
 const { keys } = vectors
 
 describe('device vectors', () => {
-  test('device id and safety code', () => {
+  test('device id and safety codes', () => {
     expect(deviceId(keys.device.publicKey)).toBe(keys.device.deviceId)
-    expect(safetyCode(keys.device.publicKey)).toBe(keys.device.safetyCode)
+    for (const { hubKey, deviceKey, codeValue, code } of vectors.safetyCode.cases) {
+      expect(safetyCode(hubKey, deviceKey, codeValue)).toBe(code)
+    }
   })
   test('the certificate payload is the base64url of its JSON', () => {
     expect(Buffer.from(vectors.certificate.json).toString('base64url')).toBe(vectors.certificate.payload)
@@ -102,6 +104,7 @@ describe('devices on the hub', () => {
     security.addOwner(owner.key)
     security.setMode({ mode: 'default-deny' })
     hub = new Hub(port)
+    hub.devices.gate.interval = 0
     await hub.ready
     owners = client(v1(owner))
   })
@@ -119,12 +122,9 @@ describe('devices on the hub', () => {
     const id = deviceId(device.key)
     const caller = client(v1(service, device, { deviceName: 'Phone', platform: 'ios', instance: 'app' }))
     expect(await caller.sender.send('hub/info')).toMatchObject({ protocol: 2 })
-    expect(await pendingHas(id, true)).toMatchObject({
-      key: device.key,
-      name: 'Phone',
-      platform: 'ios',
-      safetyCode: safetyCode(device.key),
-    })
+    const pending = await pendingHas(id, true)
+    expect(pending).toMatchObject({ key: device.key, name: 'Phone', platform: 'ios' })
+    expect(pending.safetyCode).toBe(safetyCode(security.hubKey!, device.key, pending.codeValue))
     const echo = await echoService(makeKey(), makeKey(), 'devices/echo1')
     expect(await caller.sender.send('devices/echo1')).toEqual({ key: service.key, groups: [], owner: false })
 

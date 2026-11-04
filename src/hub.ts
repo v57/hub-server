@@ -151,10 +151,12 @@ export class Hub {
       networkStateChanged?.()
       this.devices.devicesState.setNeedsUpdate()
     }
-    networkAPI.onBindApprove = state => {
-      if (state.certificate) this.devices.approve(state.certificate.deviceId)
-    }
+    networkAPI.onBindApprove = state => this.devices.approveConnection(state)
     networkAPI.deviceLabel = id => this.devices.registry.device(id)?.name
+    networkAPI.serviceDevice = key => this.devices.registry.data.services[key]?.device
+    this.devices.sharedWith = state => networkAPI.devicesSharedWith(state)
+    this.devices.canUseHostSSH = state => networkAPI.canSignInToHost(state)
+    this.devices.hostDevice = () => networkAPI.hubHostProfile()?.device ?? this.devices.selfId
     networkAPI.deviceSSHPort = id => {
       const port = (this.devices.registry.device(id)?.capabilities?.ssh as { port?: unknown } | undefined)?.port
       return Number.isInteger(port) && (port as number) > 0 && (port as number) < 65536 ? (port as number) : undefined
@@ -200,6 +202,7 @@ export class Hub {
     this.connectionsChanged = () => {
       connectionsState.setNeedsUpdate()
       this.devices.devicesState.setNeedsUpdate()
+      this.devices.liveDataState.setNeedsUpdate()
       sendUpdates()
     }
     this.devices.register(this.channel)
@@ -245,6 +248,8 @@ export class Hub {
         hubNetNode.setNeedsUpdate()
         networkAPI.onStateChanged?.()
       })
+      // A label for this connection, for owners and callers of its services. It's never a device's name (protocol.md
+      // section 13), and a device's request shows only what its certificate asks for
       .post('hub/profile/update', ({ body: { name, icon }, state }) => {
         if (icon) state.icon = icon
         if (name) state.name = name
@@ -588,7 +593,7 @@ export class Hub {
     security.members.add(ownersGroup, keyMember(state.key!))
     const id = state.certificate?.deviceId
     if (id) {
-      this.devices.approve(id)
+      this.devices.approveConnection(state)
       security.members.add(ownersGroup, deviceMember(id))
     }
     this.connectionsChanged()
@@ -681,7 +686,8 @@ export class Hub {
         ({
           id: c.state.id,
           key: c.state.key,
-          name: c.state.name,
+          // A device still asking holds no name yet
+          name: c.state.certificate && !c.state.device ? undefined : c.state.name,
           icon: c.state.icon,
           services: c.state.services.size,
           apps: c.state.apps.size,

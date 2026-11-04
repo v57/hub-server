@@ -148,6 +148,7 @@ describe('grants on the hub', () => {
     security.addOwner(owner.key)
     security.setMode({ mode: 'default-deny' })
     hub = new Hub(port)
+    hub.devices.gate.interval = 0
     await hub.ready
     owners = client(owner)
     const provider = makeKey()

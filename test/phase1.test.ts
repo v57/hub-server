@@ -119,7 +119,8 @@ describe('security mode migration', () => {
 describe('built-in API classification', () => {
   test.each([
     ['hub/info', 'public'],
-    ['hub/profile/update', 'public'],
+    ['hub/profile/update', 'auth'],
+    ['hub/device/request', 'auth'],
     ['hub/service/update', 'public'],
     ['hub/api', 'public'],
     ['hub/status', 'public'],
@@ -199,6 +200,7 @@ describe('hub', () => {
     security.addOwner(owner.key)
     security.setMode({ mode: 'default-deny' })
     hub = new Hub(port)
+    hub.devices.gate.interval = 0
     await hub.ready
     security.host.allow(service.key, ['test/open', 'test/closed', 'test/stream'])
     const provider = client(v1(service))

@@ -9,6 +9,7 @@ import { certificate, challenge, connect, first, freePort, makeKey, token, waitF
 const port = freePort()
 const clients: Client[] = []
 const hub = new Hub(port)
+hub.devices.gate.interval = 0
 const open = (headers: () => Record<string, string> | Promise<Record<string, string>> = () => ({})) => {
   const c = connect(port, headers)
   clients.push(c)

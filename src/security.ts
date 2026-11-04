@@ -103,7 +103,6 @@ export type BuiltinAccess = 'public' | 'auth' | 'reporter' | 'grant' | 'owner' |
 
 const publicBuiltins = new Set([
   'hub/info',
-  'hub/profile/update',
   'hub/service/update',
   'hub/api',
   'hub/status',
@@ -112,8 +111,9 @@ const publicBuiltins = new Set([
   'hub/header',
 ])
 // `hub/net/bind` keeps the proof of its bind kind, `hub/net/node` tells agents where their node is, `hub/pair` makes
-// the holder of the pairing code an owner, `hub/grant/check` limits services to their own paths
-const authBuiltins = new Set(['hub/api/services', 'hub/net/bind', 'hub/net/node', 'hub/pair', 'hub/grant/check'])
+// the holder of the pairing code an owner, `hub/grant/check` limits services to their own paths,
+// `hub/profile/update` labels the caller's own connection, `hub/device/request` answers for its own certificate
+const authBuiltins = new Set(['hub/api/services', 'hub/net/bind', 'hub/net/node', 'hub/pair', 'hub/grant/check', 'hub/profile/update', 'hub/device/request'])
 const reporterBuiltins = new Set(['hub/device/describe', 'hub/device/data'])
 const grantBuiltins = new Set(['hub/devices', 'hub/devices/data'])
 
@@ -694,6 +694,10 @@ class Group {
   }
   has(group: string): boolean {
     return this.groups.has(group) || group === ownersGroup
+  }
+  /** A group of one person's devices and keys */
+  isPerson(group: string): boolean {
+    return this.groups.get(group)?.person === true
   }
   create(value: unknown): string {
     const { name, person } =

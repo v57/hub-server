@@ -31,6 +31,7 @@ describe('calls waiting for a provider', () => {
   beforeAll(async () => {
     security.addOwner(owner.key)
     hub = new Hub(port)
+    hub.devices.gate.interval = 0
     await hub.ready
     caller = client(owner)
   })

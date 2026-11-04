@@ -8,7 +8,7 @@
 // a new code and exit while the server runs, and the server must take that code at once.
 import { Channel } from 'channel/client'
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, sign, verify } from 'node:crypto'
-import { mkdtempSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -28,6 +28,12 @@ function newKey(): Key {
 const sig = (k: Key, s: string) => sign(null, Buffer.from(s), k.priv).toString('base64')
 const now = () => Math.floor(Date.now() / 1000)
 const deviceId = (k: Key) => createHash('sha256').update(Buffer.from(k.pub, 'base64')).digest('hex').slice(0, 32)
+/** protocol.md section 1 */
+function safetyCode(hub: string, device: string, codeValue: string) {
+  const hex = createHash('sha256').update(`hubcode1:${hub}:${device}:${codeValue}`).digest('hex')
+  const digits = (parseInt(hex.slice(0, 8), 16) % 1000000).toString().padStart(6, '0')
+  return `${digits.slice(0, 3)} ${digits.slice(3)}`
+}
 /** Anonymous `hub/info` with a client nonce (protocol.md section 2) */
 async function ask(to: string, nonce = randomBytes(32).toString('base64url')) {
   const probe = new Channel<any>().connect(to) as any
@@ -74,9 +80,10 @@ async function first<T>(it: AsyncIterable<T>, pred: (v: T) => boolean, ms = 4000
   return Promise.race([run, timer]) as Promise<T>
 }
 
-/** Starts the server in a fresh directory and waits until `hub/info` answers */
-async function startHub(port: number, args: string[]) {
+/** Starts the server in a fresh directory and waits until `hub/info` answers. `prepare` plants files there first. */
+async function startHub(port: number, args: string[], prepare?: (dir: string) => void) {
   const dir = mkdtempSync(join(tmpdir(), 'hub-e2e-'))
+  prepare?.(dir)
   const proc = Bun.spawn(['sh', '-c', `exec ${HUB_SERVER_CMD} "$@"`, 'hub-server', '--port', String(port), ...args], {
     cwd: dir,
     env: { ...process.env, HUB_DEVICE_KEY: join(dir, 'device.key'), HUBLISTEN: '', HUBOWNER: '', HUB_MODE: '' },
@@ -360,6 +367,210 @@ try {
     let value: any
     try { value = await first(ownerC.values('network/devices/revoked'), () => true, 2500) } catch (e: any) { value = String(e?.message ?? e) }
     assert(Array.isArray(value), `network/devices/revoked → ${JSON.stringify(value)}`)
+  })
+
+  // 5b. device requests: safety codes and the rate limit (protocol.md sections 1 and 6)
+  const failed = (promise: Promise<unknown>, ms = 3000) =>
+    Promise.race([promise.then(() => 'ok', (e: any) => String(e?.message ?? e)), wait(ms).then(() => 'timeout')])
+  const asking = (name: string, device = newKey(), service = newKey()) => {
+    const c = connect(async () => ({ ...(await auth(service, hubKey)), device: cert(device, service, name, { deviceName: name }) }))
+    return { c, device, service, id: deviceId(device) }
+  }
+  const requested = (a: { c: any }, status = 'pending', ms = 6000) =>
+    first<any>(a.c.values('hub/device/request'), r => r?.status === status, ms)
+  const pendingRow = async (id: string) =>
+    (await first<any[]>(ownerC.values('hub/devices/pending'), l => Array.isArray(l) && l.some(d => d.id === id))).find(d => d.id === id)
+  await check('a request gets a value from the hub, and both sides compute one code from it', async () => {
+    const a = asking('Coded')
+    const request = await requested(a)
+    assert(request.id === a.id && typeof request.codeValue === 'string' && request.codeValue.length >= 32, `request ${JSON.stringify(request)}`)
+    const row = await pendingRow(a.id)
+    assert(row.codeValue === request.codeValue, 'the owner and the device got different values')
+    assert(row.safetyCode === safetyCode(hubKey, a.device.pub, request.codeValue), `code ${row.safetyCode}`)
+    a.c.stop()
+  })
+  await check('a request sent again with the same key keeps its value', async () => {
+    const device = newKey()
+    const a = asking('Again', device)
+    const { codeValue } = await requested(a)
+    a.c.stop()
+    const b = asking('Again', device)
+    assert((await requested(b)).codeValue === codeValue, 'the value changed for the same key')
+    b.c.stop()
+  })
+  await check('new requests get on the list one a second at most', async () => {
+    const before = Date.now()
+    const many = [1, 2, 3].map(n => asking(`Many ${n}`))
+    await Promise.all(many.map(a => requested(a)))
+    assert(Date.now() - before >= 1700, `3 requests in ${Date.now() - before} ms`)
+    many.forEach(a => a.c.stop())
+  })
+  await check('hub/device/request needs a key and a certificate', async () => {
+    const plain = connect(() => auth(newKey(), hubKey))
+    assert((await failed(first(plain.values('hub/device/request'), () => true))).includes('no device certificate'), 'a plain key has a request')
+    assert((await failed(first(connect(() => ({})).values('hub/device/request'), () => true))) !== 'ok', 'an anonymous connection has a request')
+  })
+
+  // 5c. names, unique per hub (protocol.md section 13)
+  const approved = async (name: string, device?: Key, service?: Key) => {
+    const a = asking(name, device, service)
+    await requested(a)
+    const result = await ownerC.send('hub/device/approve', { id: a.id })
+    return { ...a, name: result.name as string }
+  }
+  const nameOf = async (id: string, expected: string) =>
+    (await first<any[]>(ownerC.values('hub/devices'), l => Array.isArray(l) && l.find(d => d.id === id)?.name === expected)).find(d => d.id === id).name
+  await check('the second device asking for a name gets a suffix on approval', async () => {
+    const a = await approved('Avery'), b = await approved('Avery')
+    assert(a.name === 'Avery' && b.name === 'Avery-2', `${a.name}, ${b.name}`)
+  })
+  await check('lookalikes count as the same name, and it stays as written', async () => {
+    const cyrillic = await approved('\u0410very'), spaced = await approved('A very'), invisible = await approved('A\u200Bvery')
+    assert(cyrillic.name === '\u0410very-3' && spaced.name === 'A very-4' && invisible.name === 'A\u200Bvery-5', [cyrillic.name, spaced.name, invisible.name].join(', '))
+  })
+  await check('a pending request holds no name and shows what it asks for', async () => {
+    const early = asking('Quinn')
+    await requested(early)
+    const holder = await approved('Quinn')
+    assert(holder.name === 'Quinn', `holder ${holder.name}`)
+    assert((await pendingRow(early.id)).name === 'Quinn', 'the request should still show what it asks for')
+    assert((await ownerC.send('hub/device/approve', { id: early.id })).name === 'Quinn-2', 'the request took a held name')
+    assert((await requested(early, 'approved')).name === 'Quinn-2', 'the device was not told its final name')
+    early.c.stop()
+  })
+  await check('hub/profile/update names no device and needs a key', async () => {
+    const quiet = asking('Quiet')
+    await requested(quiet)
+    await quiet.c.send('hub/profile/update', { name: 'Avery' })
+    assert((await pendingRow(quiet.id)).name === 'Quiet', 'a profile changed the name of a request')
+    assert((await failed(connect(() => ({})).send('hub/profile/update', { name: 'Avery' }))) !== 'ok', 'an anonymous caller set a name')
+    const service = connect(() => auth(newKey(), hubKey))
+    await service.send('hub/profile/update', { name: 'S3 Backup' })
+    await first<any[]>(ownerC.values('hub/connections'), l => Array.isArray(l) && l.some(c => c.name === 'S3 Backup'))
+    quiet.c.stop()
+  })
+  await check('an approved device asking again keeps its name, and a new one has to be free', async () => {
+    const device = newKey()
+    const first_ = await approved('Harper')
+    const second = await approved('Harper', device)
+    assert(second.name === 'Harper-2', second.name)
+    first_.c.stop()
+    const again = asking('Harper', device)
+    await again.c.send('hub/info')
+    await nameOf(second.id, 'Harper-2')
+    const moved = asking('Fresh Name', device)
+    await moved.c.send('hub/info')
+    await nameOf(second.id, 'Fresh Name')
+    again.c.stop()
+    moved.c.stop()
+  })
+  await check('owner-set names win', async () => {
+    const asked = await approved('Morgan'), other = await approved('Dana')
+    assert((await ownerC.send('hub/device/rename', { id: other.id, name: 'MORGAN' })).name === 'MORGAN', 'rename')
+    await nameOf(asked.id, 'Morgan-2')
+    const result = await failed(ownerC.send('hub/device/rename', { id: asked.id, name: 'morgan' }))
+    assert(result.includes('name taken'), `renaming onto an owner's name: ${result}`)
+    const late = await approved('Morgan')
+    assert(late.name === 'Morgan-3', `a device took an owner's name: ${late.name}`)
+  })
+
+  // 5d. what members see (protocol.md section 13)
+  const list = (c: any, pred: (l: any[]) => boolean = () => true) => first<any[]>(c.values('hub/devices'), l => Array.isArray(l) && pred(l))
+  const ids = (l: any[]) => l.map(d => d.id).sort().join()
+  const memberA = await approved('Member A'), memberB = await approved('Member B')
+  await check('a member sees its own device, not the others', async () => {
+    const seen = await list(memberA.c)
+    assert(ids(seen) === memberA.id, `saw ${seen.map(d => d.name)}`)
+    const everything = await list(ownerC, l => l.some(d => d.id === memberA.id) && l.some(d => d.id === memberB.id))
+    assert(everything.length > 2, 'an owner sees everything')
+  })
+  await check('a grant on a service path shows the device live, with only that path, and removing it hides it', async () => {
+    const pathA = 'e2e/dir-one', pathB = 'e2e/dir-two'
+    await ownerC.send('hub/host/update', { key: memberB.service.pub, allow: [pathA, pathB] })
+    await memberB.c.send('hub/service/update', { services: [{ path: pathA }, { path: pathB }], reporter: true })
+    await memberB.c.send('hub/device/describe', { os: 'secret', capabilities: { cpu: { cores: 64 } } })
+    const updates = memberA.c.values('hub/devices')[Symbol.asyncIterator]()
+    assert(ids((await updates.next()).value) === memberA.id, 'the first value')
+    const grant = await ownerC.send('hub/grant/add', { subject: { device: memberA.id }, object: { path: pathA } })
+    const next = async (pred: (l: any[]) => boolean) => {
+      const timer = wait(4000).then(() => { throw new Error('no live update') })
+      while (true) {
+        const { value, done } = await Promise.race([updates.next(), timer])
+        if (done) throw new Error('stream ended')
+        if (pred(value)) return value as any[]
+      }
+    }
+    const shown = (await next(l => l.some(d => d.id === memberB.id))).find(d => d.id === memberB.id)
+    assert(shown.services.length === 1 && shown.services[0].paths.join() === pathA, `services ${JSON.stringify(shown.services)}`)
+    assert(shown.os === undefined && shown.capabilities === undefined && shown.codeValue === undefined, `too much: ${JSON.stringify(shown)}`)
+    await ownerC.send('hub/grant/remove', { id: grant.id })
+    await next(l => !l.some(d => d.id === memberB.id))
+    updates.return?.()
+  })
+  await check('a person group shows that person\'s devices', async () => {
+    const group = await ownerC.send('hub/group/create', { name: 'Same Person', person: true })
+    const id = typeof group === 'string' ? group : group?.id
+    await ownerC.send('hub/group/update/users', { group: id, add: [`device:${memberA.id}`, `device:${memberB.id}`] })
+    await list(memberA.c, l => l.some(d => d.id === memberB.id && d.os === 'secret'))
+    await ownerC.send('hub/group/update/users', { group: id, remove: [`device:${memberA.id}`, `device:${memberB.id}`] })
+    await list(memberA.c, l => !l.some(d => d.id === memberB.id))
+  })
+  await check('live data stays with the device and owners', async () => {
+    await memberB.c.send('hub/device/data', { cpu: 0.5 })
+    const hidden = await failed(first(memberA.c.values('hub/devices/data', { id: memberB.id }), () => true))
+    assert(hidden.includes('device not found'), `another's data: ${hidden}`)
+    const missing = await failed(first(memberA.c.values('hub/devices/data', { id: '0'.repeat(32) }), () => true))
+    assert(missing === hidden, 'a hidden device answers differently from one that does not exist')
+    await first<any>(memberB.c.values('hub/devices/data', { id: memberB.id }), d => d?.cpu === 0.5)
+    await first<any>(ownerC.values('hub/devices/data', { id: memberB.id }), d => d?.cpu === 0.5)
+  })
+  await check('a pending device and an unapproved key see no devices', async () => {
+    const waiting = asking('Waiting')
+    await requested(waiting)
+    assert((await failed(first(waiting.c.values('hub/devices'), () => true))).includes('permissions required'), 'a pending device read the directory')
+    assert((await failed(first(connect(() => auth(newKey(), hubKey)).values('hub/devices'), () => true))).includes('permissions required'), 'a plain key read the directory')
+    waiting.c.stop()
+  })
+  await check('network/agents/list hides other members from a member', async () => {
+    const value = await first<any>(memberA.c.values('network/agents/list'), () => true)
+    assert(Array.isArray(value) && value.length === 0, `agents ${JSON.stringify(value)}`)
+  })
+
+  // 5e. a store from before names were unique
+  await check('duplicate names in a store settle at load, without touching owner-set names', async () => {
+    const storedOwner = newKey()
+    const stored = (name: string, createdAt: string, extra: object = {}) => ({ key: name, name, approved: true, createdAt, lastSeen: createdAt, revoked: null, ...extra })
+    const old = await startHub(port + 6000, ['--owner', storedOwner.pub], dir => {
+      mkdirSync(join(dir, 'data'), { recursive: true })
+      writeFileSync(join(dir, 'data', 'devices.json'), JSON.stringify({
+        schema: 1,
+        services: {},
+        revokedKeys: [],
+        devices: {
+          ['a'.repeat(32)]: stored('Alex', '2026-03-01T00:00:00Z'),
+          ['b'.repeat(32)]: stored('Alex', '2026-01-01T00:00:00Z'),
+          ['c'.repeat(32)]: stored('\u0410lex', '2026-02-01T00:00:00Z'),
+          ['d'.repeat(32)]: stored('Sam', '2026-01-01T00:00:00Z', { nameByOwner: true }),
+          ['e'.repeat(32)]: stored('Sam', '2026-02-01T00:00:00Z', { nameByOwner: true }),
+          ['f'.repeat(32)]: stored('Alex', '2026-04-01T00:00:00Z', { approved: false }),
+        },
+      }))
+    })
+    try {
+      const to = `ws://127.0.0.1:${port + 6000}`
+      const key = (await ask(to)).info.key
+      const c = connect(() => auth(storedOwner, key, to), undefined, to)
+      const devices = await list(c, l => l.length >= 6)
+      const name = (letter: string) => devices.find(d => d.id === letter.repeat(32))?.name
+      assert(name('b') === 'Alex', `oldest ${name('b')}`)
+      assert(name('c') === '\u0410lex-2', `second ${name('c')}`)
+      assert(name('a') === 'Alex-3', `third ${name('a')}`)
+      assert(name('d') === 'Sam' && name('e') === 'Sam', `owner-set ${name('d')}, ${name('e')}`)
+      assert(name('f') === 'Alex', `pending ${name('f')}`)
+      c.stop?.()
+    } finally {
+      old.proc.kill()
+    }
   })
 
   // 6. pairing the first owner (protocol.md section 12)

@@ -1,8 +1,9 @@
-import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, verify } from 'node:crypto'
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, verify } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import { homedir, hostname } from 'node:os'
 import { dirname, join } from 'node:path'
 import { Storage, writeAtomically } from './settings'
+import { cleanName, freeName, normalizeName } from './names'
 
 // Device layer, protocol.md sections 1, 3, 5, 6 and 8
 
@@ -16,9 +17,15 @@ export function deviceId(key: string): string {
   return createHash('sha256').update(Buffer.from(key, 'base64')).digest('hex').slice(0, 32)
 }
 
-/** Six digits from the key hash, shown as `ddd ddd` on both devices when approving */
-export function safetyCode(key: string): string {
-  const hash = createHash('sha256').update(Buffer.from(key, 'base64')).digest('hex')
+/** What a device's safety code covers besides its key: 32 random bytes, picked once the hub has the key */
+export const newCodeValue = () => randomBytes(32).toString('base64url')
+
+/**
+ * Six digits shown as `ddd ddd` on the device and to the owner approving it. The value comes from the hub after it has
+ * the key, so a key can't be ground offline to match a code: each guess costs one request.
+ */
+export function safetyCode(hubKey: string, key: string, codeValue: string): string {
+  const hash = createHash('sha256').update(`hubcode1:${hubKey}:${key}:${codeValue}`).digest('hex')
   const code = (parseInt(hash.slice(0, 8), 16) % 1000000).toString().padStart(6, '0')
   return `${code.slice(0, 3)} ${code.slice(3)}`
 }
@@ -96,6 +103,10 @@ export interface StoredDevice {
   name: string
   /** An owner renamed it, the device's own suggestions no longer apply */
   nameByOwner?: boolean
+  /** The name it last asked for, when the one it got differs */
+  askedName?: string
+  /** What its safety code covers, kept for as long as the hub knows the device */
+  codeValue?: string
   platform?: string
   os?: string
   arch?: string
@@ -130,8 +141,12 @@ export interface PendingDevice {
   platform?: string
   parent?: string
   safetyCode: string
+  codeValue: string
   firstSeen: string
 }
+
+/** Most pending requests a hub keeps. A guess against a code has to be on the list when the owner compares. */
+export const maxPendingDevices = 256
 
 /** `data/devices.json`: devices, where each service key runs, and the keys revoked with a device */
 export class DeviceRegistry {
@@ -139,6 +154,8 @@ export class DeviceRegistry {
   storage: Storage
   /** Devices, placements or revocations changed */
   onChange?: () => void
+  /** The hub's key, which safety codes cover */
+  hubKey = ''
   constructor(path = 'data/devices.json') {
     this.storage = new Storage(
       path,
@@ -148,7 +165,65 @@ export class DeviceRegistry {
   }
   async load(): Promise<this> {
     await this.storage.load()
+    if (!this.storage.corrupt && this.settleStored()) await this.storage.write()
     return this
+  }
+  /**
+   * Stores from before names were unique and codes covered a value: every device gets a value, and of approved devices
+   * with the same name the one that came first keeps it. Names an owner set stay, even two of the same.
+   */
+  private settleStored(): boolean {
+    let changed = false
+    const entries = Object.entries(this.data.devices)
+    for (const [, device] of entries) {
+      if (device.codeValue || device.revoked) continue
+      device.codeValue = newCodeValue()
+      changed = true
+    }
+    const holders = entries
+      .filter(([, device]) => device.approved && !device.revoked)
+      .sort(([a, left], [b, right]) => left.createdAt.localeCompare(right.createdAt) || a.localeCompare(b))
+    const held = new Set(holders.filter(([, device]) => device.nameByOwner).map(([, device]) => normalizeName(device.name)))
+    for (const [, device] of holders) {
+      if (device.nameByOwner) continue
+      const name = freeName(device.name, normalized => held.has(normalized))
+      if (name !== device.name) {
+        device.askedName = device.name
+        device.name = name
+        changed = true
+      }
+      held.add(normalizeName(name))
+    }
+    const pending = entries.filter(([, device]) => !device.approved && !device.revoked)
+    pending.sort(([, left], [, right]) => left.createdAt.localeCompare(right.createdAt))
+    for (const [id] of pending.slice(0, Math.max(0, pending.length - maxPendingDevices))) {
+      delete this.data.devices[id]
+      changed = true
+    }
+    return changed
+  }
+  /** The names approved devices hold, normalized, except `id`'s. A pending request or a revoked device holds none. */
+  private heldNames(id?: string): Map<string, string> {
+    const held = new Map<string, string>()
+    for (const [other, device] of Object.entries(this.data.devices)) {
+      if (other !== id && device.approved && !device.revoked) held.set(normalizeName(device.name), other)
+    }
+    return held
+  }
+  private freeNameFor(id: string, asked: string): string {
+    const held = this.heldNames(id)
+    return freeName(asked, normalized => held.has(normalized))
+  }
+  /** A device suggests a name for itself: a pending one shows what it asks for, an approved one gets a free name */
+  private suggest(id: string, device: StoredDevice, asked: string) {
+    if (device.nameByOwner) return
+    const clean = cleanName(asked)
+    if (!device.approved) {
+      device.name = clean
+    } else if (clean !== (device.askedName ?? device.name)) {
+      device.askedName = clean
+      device.name = this.freeNameFor(id, clean)
+    }
   }
   private save() {
     this.onChange?.()
@@ -171,7 +246,8 @@ export class DeviceRegistry {
     if (!device) {
       device = {
         key: certificate.device,
-        name: certificate.deviceName ?? certificate.instance,
+        name: cleanName(certificate.deviceName ?? certificate.instance),
+        codeValue: newCodeValue(),
         platform: certificate.platform,
         parent: certificate.parent,
         approved: false,
@@ -182,13 +258,43 @@ export class DeviceRegistry {
       this.data.devices[certificate.deviceId] = device
     } else {
       device.lastSeen = now
-      if (certificate.deviceName && !device.nameByOwner) device.name = certificate.deviceName
+      if (certificate.deviceName) this.suggest(certificate.deviceId, device, certificate.deviceName)
       if (certificate.platform) device.platform = certificate.platform
       if (certificate.parent !== undefined) device.parent = certificate.parent
     }
-    if (approve) device.approved = true
+    if (approve) this.settle(certificate.deviceId, device)
     this.save()
     return device
+  }
+  /** Approved from now on: a request gets its final name here */
+  private settle(id: string, device: StoredDevice) {
+    if (device.approved) return
+    device.approved = true
+    if (device.nameByOwner) {
+      this.claim(id, device, device.name)
+    } else {
+      const name = this.freeNameFor(id, device.name)
+      if (name !== device.name) device.askedName = device.name
+      device.name = name
+    }
+  }
+  /**
+   * An owner's name: a device that only asked for the same one moves to a free name. Against a name an owner set, the
+   * newer one gets the suffix, for an approval that has no one to ask, or `name taken` for a rename.
+   */
+  private claim(id: string, device: StoredDevice, name: string, refuse = false) {
+    const holder = this.heldNames(id).get(normalizeName(name))
+    const other = holder ? this.data.devices[holder] : undefined
+    if (other?.nameByOwner) {
+      if (refuse) throw 'name taken'
+      device.name = this.freeNameFor(id, name)
+      return
+    }
+    device.name = name
+    if (other) {
+      other.askedName ??= other.name
+      other.name = this.freeNameFor(holder!, other.askedName)
+    }
   }
   /** Places a service key on an approved device. Returns the device it moved from, if it moved. */
   place(certificate: Certificate, name?: string): string | undefined {
@@ -208,21 +314,24 @@ export class DeviceRegistry {
   approve(id: string): StoredDevice {
     const device = this.require(id)
     if (device.revoked) throw 'device revoked'
-    device.approved = true
+    this.settle(id as string, device)
     this.save()
     return device
   }
   rename(id: string, name: unknown): StoredDevice {
     if (typeof name !== 'string' || !name.trim() || bytes(name.trim()) > 64) throw 'invalid name'
     const device = this.require(id)
-    device.name = name.trim()
+    const clean = cleanName(name)
+    if (device.approved) this.claim(id, device, clean, true)
+    else device.name = clean
     device.nameByOwner = true
+    delete device.askedName
     this.save()
     return device
   }
   update(id: string, update: Partial<Pick<StoredDevice, 'name' | 'os' | 'arch' | 'capabilities'>>) {
     const device = this.require(id)
-    if (update.name !== undefined && !device.nameByOwner) device.name = update.name
+    if (update.name !== undefined) this.suggest(id, device, update.name)
     if (update.os !== undefined) device.os = update.os
     if (update.arch !== undefined) device.arch = update.arch
     if (update.capabilities !== undefined) device.capabilities = update.capabilities
@@ -262,15 +371,105 @@ export class DeviceRegistry {
         name: device.name,
         platform: device.platform,
         parent: device.parent,
-        safetyCode: safetyCode(device.key),
+        safetyCode: safetyCode(this.hubKey, device.key, this.codeValue(device)),
+        codeValue: this.codeValue(device),
         firstSeen: device.createdAt,
       }))
+  }
+  /** Its value, which it keeps once picked */
+  codeValue(device: StoredDevice): string {
+    return (device.codeValue ??= newCodeValue())
+  }
+  /** The ids of pending requests, oldest first */
+  pendingIds(): string[] {
+    return Object.entries(this.data.devices)
+      .filter(([, device]) => !device.approved && !device.revoked)
+      .sort(([, left], [, right]) => left.createdAt.localeCompare(right.createdAt))
+      .map(([id]) => id)
   }
   private require(id: unknown): StoredDevice {
     const device = typeof id === 'string' ? this.data.devices[id] : undefined
     if (!device) throw 'device not found'
     return device
   }
+}
+
+/** A request waits its turn with these at most: per source, and sources */
+const maxWaitingPerSource = 8
+const maxWaitingSources = 4096
+
+/**
+ * The one way a new device gets on the pending list: one request a second for the whole hub, sources taking turns, so
+ * rotating addresses doesn't buy guesses and one flooding address doesn't push others out. A flood delays a real
+ * request. What waits is bounded; a request beyond that isn't queued, and the connection asks again when its stream
+ * recomputes or it reconnects.
+ */
+export class RequestGate<Request extends { deviceId: string }> {
+  /** Milliseconds between requests */
+  interval = 1000
+  /** Oldest turn first */
+  private waiting = new Map<string, Request[]>()
+  private lastAdmission = -Infinity
+  private timer?: ReturnType<typeof setTimeout>
+  constructor(private admit: (request: Request) => void) {}
+  has(deviceId: string): boolean {
+    for (const requests of this.waiting.values()) if (requests.some(request => request.deviceId === deviceId)) return true
+    return false
+  }
+  /** Queues a request, once per device. Admits at once while the hub is idle. */
+  ask(source: string, request: Request) {
+    if (this.has(request.deviceId)) return
+    const queue = this.waiting.get(source)
+    if (queue ? queue.length >= maxWaitingPerSource : this.waiting.size >= maxWaitingSources) return
+    if (queue) queue.push(request)
+    else this.waiting.set(source, [request])
+    this.next()
+  }
+  /** Forgets what `matches` picks: its connection went, or it needs no turn any more */
+  forget(matches: (request: Request) => boolean) {
+    for (const [source, requests] of this.waiting) {
+      const left = requests.filter(request => !matches(request))
+      if (left.length) this.waiting.set(source, left)
+      else this.waiting.delete(source)
+    }
+  }
+  private next() {
+    if (this.timer || !this.waiting.size) return
+    const wait = this.lastAdmission + this.interval - performance.now()
+    if (wait > 0) {
+      this.timer = setTimeout(() => {
+        this.timer = undefined
+        this.next()
+      }, wait)
+      this.timer.unref?.()
+      return
+    }
+    const [source, requests] = this.waiting.entries().next().value!
+    const request = requests.shift()!
+    // The source goes to the end of the line
+    this.waiting.delete(source)
+    if (requests.length) this.waiting.set(source, requests)
+    this.lastAdmission = performance.now()
+    this.admit(request)
+    this.next()
+  }
+}
+
+/**
+ * The address a request counts against: IPv4, or the /64 of IPv6, which is what one host usually has. Behind a proxy
+ * every request has the proxy's address, so they share one turn; the hub trusts no forwarded header, as a client could
+ * send any, and the limit for the whole hub holds either way.
+ */
+export function requestSource(address: string | undefined): string {
+  if (!address) return 'unknown'
+  const plain = address.split('%')[0]!.toLowerCase()
+  if (plain.startsWith('::ffff:') && plain.includes('.')) return plain.slice(7)
+  if (!plain.includes(':')) return plain
+  const [head = '', tail] = plain.split('::')
+  const leading = head ? head.split(':') : []
+  const trailing = tail ? tail.split(':') : []
+  const groups = [...leading, ...Array(Math.max(0, 8 - leading.length - trailing.length)).fill('0'), ...trailing]
+  return groups.slice(0, 4).map(group => parseInt(group, 16).toString(16)).join(':') + '::/64'
 }
 
 function emptyDevices(): DevicesData {
