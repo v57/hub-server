@@ -30,6 +30,12 @@ export function safetyCode(hubKey: string, key: string, codeValue: string): stri
   return `${code.slice(0, 3)} ${code.slice(3)}`
 }
 
+/** What a parent signs to take a child: `hubattach1:<hub SPKI>:<parent SPKI>:<child SPKI>:<at>` (protocol.md section 14) */
+export const attachSignedData = (hubKey: string, parentKey: string, childKey: string, at: number) =>
+  `hubattach1:${hubKey}:${parentKey}:${childKey}:${at}`
+/** An attach signature counts for this long either way, in seconds */
+export const attachLifetime = 300
+
 /** A verified `device` header */
 export interface Certificate {
   device: string
@@ -116,6 +122,12 @@ export interface StoredDevice {
   lastSeen: string
   revoked: string | null
   capabilities?: Record<string, unknown>
+  /** The parent that signed for this device. Checked once at attach, and calls never walk it. */
+  attached?: { parent: string; parentKey: string; at: number; signature: string; linked?: true }
+  /** It asked to attach, to `parent` if it named one */
+  attachAsk?: { at: string; parent?: string }
+  /** An attach request was turned down; further ones are ignored while the hub knows it */
+  attachDismissed?: true
 }
 
 export interface StoredService {
@@ -143,6 +155,19 @@ export interface PendingDevice {
   safetyCode: string
   codeValue: string
   firstSeen: string
+}
+
+/** `hub/device/attach/requests`: a device that asked to attach, with what to compare before signing */
+export interface AttachRequest {
+  id: string
+  key: string
+  name: string
+  platform?: string
+  approved: boolean
+  safetyCode: string
+  codeValue: string
+  parent?: string
+  askedAt: string
 }
 
 /** Most pending requests a hub keeps. A guess against a code has to be on the list when the owner compares. */
@@ -296,6 +321,107 @@ export class DeviceRegistry {
       other.name = this.freeNameFor(holder!, other.askedName)
     }
   }
+  /** A device with a certificate asks to attach. Ignored once attached or turned down. */
+  askAttach(id: string, parent?: string) {
+    const device = this.require(id)
+    if (device.revoked || device.attached || device.attachDismissed) return
+    if (device.attachAsk && device.attachAsk.parent === parent) return
+    device.attachAsk = { at: new Date().toISOString(), ...(parent ? { parent } : {}) }
+    this.save()
+  }
+  /** Turns an attach request down */
+  dismissAttach(id: unknown) {
+    const device = this.require(id)
+    delete device.attachAsk
+    device.attachDismissed = true
+    this.save()
+  }
+  /** What's asked of the hub right now, oldest first */
+  attachRequests(): AttachRequest[] {
+    return Object.entries(this.data.devices)
+      .filter(([, device]) => device.attachAsk && !device.attached && !device.revoked)
+      .sort(([, left], [, right]) => left.attachAsk!.at.localeCompare(right.attachAsk!.at))
+      .map(([id, device]) => ({
+        id,
+        key: device.key,
+        name: device.name,
+        platform: device.platform,
+        approved: device.approved,
+        safetyCode: safetyCode(this.hubKey, device.key, this.codeValue(device)),
+        codeValue: this.codeValue(device),
+        parent: device.attachAsk!.parent,
+        askedAt: device.attachAsk!.at,
+      }))
+  }
+  /**
+   * The parent's signature, checked here and never again. The child must have asked, and it starts with nothing linked.
+   * `approve`: the signer is an owner, whose word approves the child too.
+   */
+  attach(childId: unknown, parentId: string, at: unknown, signature: unknown, approve: boolean, now = Math.floor(Date.now() / 1000)): StoredDevice {
+    const child = this.require(childId)
+    const parent = this.require(parentId)
+    const id = childId as string
+    if (child.revoked || parent.revoked) throw 'device revoked'
+    if (!parent.approved) throw 'permissions required'
+    if (child.attached) throw 'already attached'
+    if (!child.attachAsk) throw 'no attach request'
+    // Up from the parent: reaching the child would close a loop. Stored links can't loop, the seen set is a guard.
+    const seen = new Set<string>()
+    for (let current: string | undefined = parentId; current && !seen.has(current); current = this.data.devices[current]?.attached?.parent) {
+      if (current === id) throw 'attach would make a loop'
+      seen.add(current)
+    }
+    if (!Number.isInteger(at) || Math.abs((at as number) - now) > attachLifetime) throw 'attach signature expired'
+    if (typeof signature !== 'string' || !verifySignature(parent.key, attachSignedData(this.hubKey, parent.key, child.key, at as number), signature)) throw 'invalid signature'
+    child.attached = { parent: parentId, parentKey: parent.key, at: at as number, signature }
+    delete child.attachAsk
+    if (approve) this.settle(id, child)
+    this.save()
+    return child
+  }
+  /** Ends a link. The device stays as it is otherwise; the copies it had go with the link. */
+  detach(id: unknown): StoredDevice {
+    const device = this.require(id)
+    if (!device.attached) throw 'not attached'
+    delete device.attached
+    this.save()
+    return device
+  }
+  /** Whether the chain of linked grants reaches this child: new children start out of it */
+  setLinked(id: unknown, linked: boolean): StoredDevice {
+    const device = this.require(id)
+    if (!device.attached) throw 'not attached'
+    if ((device.attached.linked === true) === linked) return device
+    if (linked) device.attached.linked = true
+    else delete device.attached.linked
+    this.save()
+    return device
+  }
+  isChild(id: string): boolean {
+    return !!this.data.devices[id]?.attached
+  }
+  /** The children linked grants pass to: approved, not revoked, and linked by the owner */
+  linkedChildren(id: string): string[] {
+    return Object.entries(this.data.devices).flatMap(([child, device]) =>
+      device.attached?.parent === id && device.attached.linked && device.approved && !device.revoked ? [child] : [],
+    )
+  }
+  /** Every device below this one, linked or not, nearest first */
+  below(id: string): string[] {
+    const found: string[] = []
+    const walk = [id]
+    const seen = new Set([id])
+    while (walk.length) {
+      const current = walk.shift()!
+      for (const [child, device] of Object.entries(this.data.devices)) {
+        if (device.attached?.parent !== current || seen.has(child)) continue
+        seen.add(child)
+        found.push(child)
+        walk.push(child)
+      }
+    }
+    return found
+  }
   /** Places a service key on an approved device. Returns the device it moved from, if it moved. */
   place(certificate: Certificate, name?: string): string | undefined {
     const now = new Date().toISOString()
@@ -391,6 +517,15 @@ export class DeviceRegistry {
     const device = typeof id === 'string' ? this.data.devices[id] : undefined
     if (!device) throw 'device not found'
     return device
+  }
+}
+
+function verifySignature(spki: string, text: string, signature: string): boolean {
+  try {
+    const key = createPublicKey({ key: Buffer.from(spki, 'base64'), format: 'der', type: 'spki' })
+    return key.asymmetricKeyType === 'ed25519' && verify(null, Buffer.from(text), key, Buffer.from(signature, 'base64'))
+  } catch {
+    return false
   }
 }
 

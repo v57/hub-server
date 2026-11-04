@@ -42,7 +42,7 @@ export function localAddress(address: number | string): string {
 }
 
 export interface HubOptions {
-  /** Local mode (`--local`, `HUB_MODE=local`): 127.0.0.1 only, `default-allow`, the launcher is an owner, no pairing */
+  /** Local mode (`--local`, `HUB_MODE=local`): 127.0.0.1 only, `default-allow`, the first owner pairs like anywhere */
   local?: boolean
 }
 
@@ -60,6 +60,8 @@ export interface State {
   instance?: string
   /** A valid certificate, also from a pending device */
   certificate?: Certificate
+  /** Its device asked to attach before it had a row (`hub/device/attach/ask`) */
+  attachAsk?: { parent?: string }
   /** Its paths take no new calls (`hub/service/update { draining: true }`); running calls go on */
   draining?: boolean
 }
@@ -183,8 +185,12 @@ export class Hub {
       this.header.load(),
       this.hubNetNode.load(),
       this.devices.load(security.hubKey),
-      this.local ? undefined : this.pairing.load(),
+      this.pairing.load(),
     ]).then(() => {
+      // Everything is loaded: copies follow the stored links, and the launcher has its grant
+      security.grants.chain = id => this.devices.registry.linkedChildren(id)
+      security.grants.settleCopies()
+      security.settleLauncher(key => this.devices.registry.isKeyRevoked(key))
       hubNetNode.setNeedsUpdate()
       networkAPI.onStateChanged?.()
     })
@@ -221,6 +227,8 @@ export class Hub {
       })
       .post('hub/pair', async ({ body, state, sender }) => {
         if (!state.key || this.merger.connectionFor(sender)) throw 'unauthorized'
+        // Asked before the code is used up: a child never becomes an owner
+        if (state.certificate && this.devices.registry.isChild(state.certificate.deviceId)) throw 'an owner can not be a child'
         await this.pairing.verify(body?.code)
         this.addPairedOwner(state)
         return { owner: true, hubKey: security.hubKey, name: (await this.header.load()).name }
@@ -228,7 +236,6 @@ export class Hub {
       .post('hub/pair/new', async ({ sender }) => {
         // Owner-only as a built-in; a merged hub's caller is never one
         if (this.merger.connectionFor(sender)) throw 'permissions required'
-        if (this.local) throw 'no pairing in local mode'
         const code = await this.pairing.create()
         console.log(`Pairing code: ${code}`)
         return { code, expires: this.pairing.expires }
@@ -439,9 +446,11 @@ export class Hub {
       .stream('hub/grants', () => security.grants.subscription.makeIterator())
       .post('hub/grant/add', ({ body, state }) => security.addGrant(body, state))
       .post('hub/grant/check', ({ body, state, sender }) => this.checkGrant(body, state, sender))
-      .post('hub/grant/remove', ({ body }) => {
-        if (!security.grants.remove(body?.id)) throw 'grant not found'
+      .post('hub/grant/link', ({ body }) => {
+        if (typeof body?.linked !== 'boolean') throw 'invalid linked'
+        return security.grants.setLinked(body?.id, body.linked)
       })
+      .post('hub/grant/remove', ({ body }) => security.removeGrant(body?.id))
       .post('hub/whitelist', async ({ body: { enabled, add, remove, allowsCurrent }, state, path }) => {
         security.requireOwner(state, path)
         security.whitelist.setEnabled(enabled)
@@ -582,10 +591,9 @@ export class Hub {
   stats() {
     this.services.map(a => a)
   }
-  /** At start: a pairing code when the hub has no owners, see `Pairing.start`. None in local mode. */
+  /** At start: a pairing code when the hub has no owners, see `Pairing.start`, in local mode too */
   async startPairing(): Promise<string | undefined> {
     await this.ready
-    if (this.local) return
     return this.pairing.start({ needed: security.members.members(ownersGroup).size === 0 })
   }
   /** `hub/pair` succeeded: the key and, with a certificate, its device (approved) join the owners */

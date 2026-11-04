@@ -6,9 +6,8 @@ Options:
   --merge <address>      merge this hub's api into another hub
   --proxy <address>      join another hub as a proxy
   --owner <key>          trust this key as an owner (env HUBOWNER)
-  --launcher <key>       let this key host launcher/* (env HUBLAUNCHER)
-  --local                local mode: 127.0.0.1 only, default-allow, the launcher key is an owner, no pairing
-                         (env HUB_MODE=local)
+  --launcher <key>       let this key host and call launcher/* (env HUBLAUNCHER); it's no owner
+  --local                local mode: 127.0.0.1 only, default-allow (env HUB_MODE=local)
   --pair                 write a new pairing code to data/, replacing the old one, print it and exit; a running
                          hub on that data/ takes it at once (a hub without owners makes one at start anyway)
   -h, --help             print this help`

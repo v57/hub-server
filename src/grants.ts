@@ -14,6 +14,10 @@ export interface Grant {
   /** Key of the owner who added it, `migration` for grants made from the old lists */
   by: string
   at: string
+  /** A device's own grant the owner linked: it passes to the device's linked children, any depth (protocol.md section 14) */
+  linked?: true
+  /** A copy on a child: the id of the grant it came from. Goes when that grant does, and an owner giving the same one directly ends it. */
+  copyOf?: string
 }
 
 /** Who a grant is checked against */
@@ -46,6 +50,7 @@ export function parseObject(value: any): GrantObject {
 }
 
 const sameJSON = (a: object, b: object) => JSON.stringify(a) === JSON.stringify(b)
+const identity = (subject: Subject, object: GrantObject) => JSON.stringify([subject, object])
 
 /**
  * `data/grants.json`: who may call which paths and connect to which shares. Replaces the per-key call lists, the
@@ -56,8 +61,10 @@ export class GrantStore {
   /** Old stores already turned into grants */
   migrated: string[] = []
   subscription = new FreshState<Grant[]>(() => this.grants)
-  /** Grants added or removed, for Hub Network to revoke share connections */
+  /** Grants added or removed, copies too, for Hub Network to revoke share connections */
   onChange?: (changed: Grant[]) => void
+  /** A device's linked children, from the device registry. No copies change before it has loaded. */
+  chain?: (device: string) => string[]
   storage = new Storage(
     'data/grants.json',
     () => ({ schema: 1, grants: this.grants, migrated: this.migrated }),
@@ -71,14 +78,26 @@ export class GrantStore {
         object: parseObject(grant.object),
         by: String(grant.by),
         at: String(grant.at),
+        ...(grant.linked === true && 'device' in grant.subject && grant.copyOf === undefined ? { linked: true as const } : {}),
+        ...(typeof grant.copyOf === 'string' ? { copyOf: grant.copyOf } : {}),
       }))
       this.migrated = Array.isArray(data.migrated) ? data.migrated : []
     },
   )
 
-  /** Adds a grant, or returns the same one if it exists */
+  /**
+   * Adds a grant, or returns the same one if it exists. A copy of it becomes a direct grant: the owner gave it now, so
+   * it stays when the grant it came from goes.
+   */
   add(subject: Subject, object: GrantObject, by: string): Grant {
     const existing = this.grants.find(grant => sameJSON(grant.subject, subject) && sameJSON(grant.object, object))
+    if (existing?.copyOf) {
+      delete existing.copyOf
+      existing.by = by
+      existing.at = new Date().toISOString()
+      this.changed([existing])
+      return existing
+    }
     if (existing) return existing
     const grant: Grant = { id: randomUUIDv7(), subject, object, by, at: new Date().toISOString() }
     this.grants.push(grant)
@@ -109,10 +128,78 @@ export class GrantStore {
     if (!this.migrated.includes(name)) this.migrated.push(name)
     this.storage.save()
   }
-  private changed(grants: Grant[]) {
+  /** Whether a device's own grant passes down its linked children. Only a `{ device }` grant can, and only its own. */
+  setLinked(id: unknown, linked: boolean): Grant {
+    const grant = this.grants.find(grant => grant.id === id)
+    if (!grant) throw 'grant not found'
+    if (!('device' in grant.subject) || grant.copyOf) throw 'only a device\'s own grant passes down'
+    if ((grant.linked === true) === linked) return grant
+    if (linked) grant.linked = true
+    else delete grant.linked
+    this.changed([grant])
+    return grant
+  }
+  /** The device registry changed links: writes the copies that follow, in one save */
+  settleCopies() {
+    const changed = this.settle()
+    if (!changed.length) return
     this.subscription.setNeedsUpdate()
     this.storage.save()
-    this.onChange?.(grants)
+    this.onChange?.(changed)
+  }
+  /**
+   * Makes the copies what the links say, and returns those added or removed. Every linked grant goes to each device down
+   * the chain of linked children, except where that device holds the same grant directly. The walk never decides a call:
+   * checks read the copies like any other grant.
+   */
+  private settle(): Grant[] {
+    if (!this.chain) return []
+    const direct = new Map(this.grants.filter(grant => !grant.copyOf).map(grant => [identity(grant.subject, grant.object), grant]))
+    const wanted = new Map<string, { subject: Subject; object: GrantObject; sources: Grant[] }>()
+    for (const grant of this.grants) {
+      if (grant.copyOf || !grant.linked || !('device' in grant.subject)) continue
+      const seen = new Set([grant.subject.device])
+      const walk = [grant.subject.device]
+      while (walk.length) {
+        for (const child of this.chain(walk.shift()!)) {
+          if (seen.has(child)) continue
+          seen.add(child)
+          walk.push(child)
+          const key = identity({ device: child }, grant.object)
+          if (direct.has(key)) continue
+          const entry = wanted.get(key)
+          if (entry) entry.sources.push(grant)
+          else wanted.set(key, { subject: { device: child }, object: grant.object, sources: [grant] })
+        }
+      }
+    }
+    const changed: Grant[] = []
+    const held = new Set<string>()
+    this.grants = this.grants.filter(grant => {
+      if (!grant.copyOf) return true
+      const key = identity(grant.subject, grant.object)
+      const entry = wanted.get(key)
+      if (!entry) {
+        changed.push(grant)
+        return false
+      }
+      if (!entry.sources.some(source => source.id === grant.copyOf)) grant.copyOf = entry.sources[0]!.id
+      held.add(key)
+      return true
+    })
+    for (const [key, { subject, object, sources }] of wanted) {
+      if (held.has(key)) continue
+      const copy: Grant = { id: randomUUIDv7(), subject, object, by: sources[0]!.by, at: new Date().toISOString(), copyOf: sources[0]!.id }
+      this.grants.push(copy)
+      changed.push(copy)
+    }
+    return changed
+  }
+  private changed(grants: Grant[]) {
+    const copies = this.settle()
+    this.subscription.setNeedsUpdate()
+    this.storage.save()
+    this.onChange?.([...grants, ...copies])
   }
 
   /** The subject names this caller: its key, its device, one of its groups, or everyone */

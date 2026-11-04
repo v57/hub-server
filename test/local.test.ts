@@ -62,21 +62,23 @@ describe('a hub in local mode', () => {
     expect((await Bun.file('data/hub.json').json()).security.mode).toBe('default-deny')
   })
 
-  test('the launcher key is an owner, not stored in owners', async () => {
-    const caller = client(launcher)
-    expect(await caller.sender.send('hub/key')).toBe(security.hubKey)
-    expect(security.caller(launcher.key)).toMatchObject({ owner: true, groups: [ownersGroup] })
+  test('the launcher has launcher/* by a grant and is no owner', async () => {
+    expect(await failure(client(launcher).sender.send('hub/key'))).toContain('permissions required')
+    expect(security.caller(launcher.key)).toMatchObject({ owner: false, groups: [] })
     expect(security.members.members(ownersGroup).size).toBe(0)
-    expect(await failure(client(makeKey()).sender.send('hub/key'))).toContain('permissions required')
+    expect(security.granted(security.caller(launcher.key), 'launcher/app/start')).toBe(true)
+    expect(security.granted(security.caller(makeKey().key), 'launcher/app/start')).toBe(false)
+    expect(security.granted(security.caller(launcher.key), 'other/path')).toBe(false)
   })
 
-  test('needs no pairing', async () => {
-    expect(await hub.startPairing()).toBeUndefined()
-    expect(await hub.startPairing(true)).toBeUndefined()
-    expect(await Bun.file('data/pairing-code').exists()).toBe(false)
-    expect(await failure(client(launcher).sender.send('hub/pair/new'))).toContain('no pairing in local mode')
-    expect(await failure(client(makeKey()).sender.send('hub/pair', { code: 'K7Q-2MX' }))).toContain('no pairing code')
-  })
+  test('a local hub without owners pairs, so someone can approve what connects', async () => {
+    const code = await hub.startPairing()
+    expect(code).toBeDefined()
+    expect(await Bun.file('data/pairing-code').text()).toBe(code!)
+    const owner = makeKey()
+    expect(await client(owner).sender.send('hub/pair', { code })).toMatchObject({ owner: true })
+    expect(await client(owner).sender.send('hub/key')).toBe(security.hubKey)
+  }, 15_000)
 })
 
 describe('hub-server --local', () => {
@@ -105,9 +107,9 @@ describe('hub-server --local', () => {
     }
   }
 
-  test('a fresh hub pairs, a local one does not', async () => {
+  test('a fresh hub pairs, also a local one', async () => {
     expect(await run([])).toMatchObject({ info: { mode: 'default-deny' }, pairingCode: true })
-    expect(await run(['--local'])).toMatchObject({ info: { mode: 'default-allow' }, pairingCode: false })
-    expect(await run([], { HUB_MODE: 'local' })).toMatchObject({ info: { mode: 'default-allow' }, pairingCode: false })
+    expect(await run(['--local'])).toMatchObject({ info: { mode: 'default-allow' }, pairingCode: true })
+    expect(await run([], { HUB_MODE: 'local' })).toMatchObject({ info: { mode: 'default-allow' }, pairingCode: true })
   }, 30_000)
 })

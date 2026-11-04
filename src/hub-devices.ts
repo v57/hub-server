@@ -1,4 +1,4 @@
-import type { BodyContext, Channel } from 'channel/server'
+import type { BodyContext, Channel, Sender } from 'channel/server'
 import { LazyStates } from 'channel/more'
 import { FreshState } from './fresh-state'
 import { createPublicKey, verify } from 'node:crypto'
@@ -12,6 +12,7 @@ import {
   maxPendingDevices,
   requestSource,
   verifyCertificate,
+  type AttachRequest,
   type Certificate,
   type PendingDevice,
   type StoredDevice,
@@ -38,6 +39,10 @@ export interface Device {
   services: { key: string; instance: string; name?: string; online: boolean; paths: string[] }[]
   /** What the device's safety code covers: only for owners and the device itself */
   codeValue?: string
+  /** The device that signed for it as its parent. `parent` above is only a name it declares. */
+  attachedTo?: string
+  /** Linked grants pass to it */
+  linked?: boolean
 }
 
 /** `hub/device/request`: how a connection's device stands. No code before `codeValue` comes from the hub. */
@@ -46,6 +51,8 @@ export interface DeviceRequest {
   status: 'waiting' | 'pending' | 'approved'
   name?: string
   codeValue?: string
+  /** The parent that signed for it, once attached */
+  attachedTo?: string
 }
 
 /** A request waiting for its turn, with the connection it came on */
@@ -77,6 +84,8 @@ export class HubDevices {
   pendingState = new FreshState<PendingDevice[]>(() => this.registry.pending())
   /** `hub/device/request` per connection */
   requestState = new LazyStates<State, DeviceRequest>(state => this.request(state)).dedupe('json')
+  /** `hub/device/attach/requests` per connection: an owner sees all, a parent those naming it */
+  attachRequestsState = new LazyStates<State, AttachRequest[]>(state => this.attachRequestsFor(state)).dedupe('json')
   /** New requests, one a second */
   gate = new RequestGate<WaitingRequest>(request => this.admit(request))
   /** Hub Network removes the member of a removed or revoked device */
@@ -111,6 +120,7 @@ export class HubDevices {
   ) {
     this.registry.onChange = () => this.setNeedsUpdate()
     security.deviceName = id => this.registry.device(id)?.name
+    security.isChild = id => this.registry.isChild(id)
   }
 
   /** Loads the registry and enrols the hub's own device, approved, with the hub key as its service */
@@ -163,12 +173,12 @@ export class HubDevices {
       return
     }
     state.certificate = certificate
-    if (device.approved) this.attach(state)
+    if (device.approved) this.placeOnDevice(state)
     this.pendingState.setNeedsUpdate()
   }
 
   /** A new request's turn: it joins the pending list, pushing out the oldest once that is full */
-  private admit({ certificate }: WaitingRequest) {
+  private admit({ certificate, state }: WaitingRequest) {
     if (this.registry.device(certificate.deviceId)) return
     const pending = this.registry.pendingIds()
     const online = new Set(Array.from(this.hub.connections, connection => connection.state.certificate?.deviceId))
@@ -180,6 +190,7 @@ export class HubDevices {
       for (const connection of this.connectionsOf(oldest)) connection.sender.stop()
     }
     this.registry.seen(certificate, false)
+    if (state.attachAsk) this.registry.askAttach(certificate.deviceId, state.attachAsk.parent)
     this.requestState.setNeedsUpdate()
   }
 
@@ -194,11 +205,99 @@ export class HubDevices {
       if (!this.registry.device(id)) return { id, status: 'waiting' }
       return this.request(state)
     }
-    return { id, status: device.approved ? 'approved' : 'pending', name: device.name, codeValue: this.registry.codeValue(device) }
+    return {
+      id,
+      status: device.approved ? 'approved' : 'pending',
+      name: device.name,
+      codeValue: this.registry.codeValue(device),
+      ...(device.attached ? { attachedTo: device.attached.parent } : {}),
+    }
+  }
+
+  private attachRequestsFor(state: State): AttachRequest[] {
+    const requests = this.registry.attachRequests()
+    if (this.security.isOwner(state)) return requests
+    return state.device ? requests.filter(request => request.parent === state.device) : []
+  }
+
+  /** `hub/device/attach/ask`: this connection's device asks to attach, to `parent` if it names one */
+  askAttach(state: State, parent: unknown): DeviceRequest {
+    const certificate = state.certificate
+    if (!certificate) throw 'no device certificate'
+    if (parent !== undefined && typeof parent !== 'string') throw 'invalid parent'
+    const id = certificate.deviceId
+    if (this.registry.device(id)) {
+      this.registry.askAttach(id, parent)
+    } else {
+      // Its row comes at its turn, which keeps the question
+      state.attachAsk = parent ? { parent } : {}
+      this.gate.ask(requestSource(state.ip), { deviceId: id, certificate, state })
+    }
+    return this.request(state)
+  }
+
+  /**
+   * `hub/device/attach` on the parent's own connection, with its signature. Only an owner's word also approves the child;
+   * a member's device takes only a child that named it, and an owner still approves that child.
+   */
+  attach(state: State, sender: Sender, body: any): Device {
+    const parent = state.device
+    if (!parent || this.hub.merger.connectionFor(sender)) throw 'permissions required'
+    const owner = this.hub.caller(state, sender).owner
+    const id = body?.child
+    const asked = typeof id === 'string' ? this.registry.device(id)?.attachAsk : undefined
+    if (!owner && asked?.parent !== parent) throw 'permissions required'
+    if (asked?.parent && asked.parent !== parent) throw 'named another parent'
+    if (typeof id === 'string' && this.isOwnerDevice(id)) throw 'an owner can not be a child'
+    this.registry.attach(id, parent, body?.at, body?.signature, owner)
+    const child = id as string
+    this.gate.forget(request => request.deviceId === child)
+    if (this.registry.device(child)!.approved) for (const connection of this.connectionsOf(child)) this.placeOnDevice(connection.state)
+    this.linksChanged()
+    return this.describe(child)!
+  }
+
+  /** The device itself, or a key on it, in the owners group */
+  private isOwnerDevice(id: string): boolean {
+    return this.security.isStoredOwner({ device: id }) || this.registry.servicesOn(id).some(key => this.security.isStoredOwner({ key }))
+  }
+
+  /** `hub/device/detach`: an owner, or the parent on its own connection, ends a link */
+  detach(state: State, sender: Sender, id: unknown): Device {
+    const owner = this.hub.caller(state, sender).owner
+    const parent = typeof id === 'string' ? this.registry.device(id)?.attached?.parent : undefined
+    if (!owner && (!parent || parent !== state.device)) throw 'permissions required'
+    this.registry.detach(id)
+    this.linksChanged()
+    return this.describe(id as string)!
+  }
+
+  /** `hub/device/link`: whether linked grants pass to this child */
+  link(id: unknown, linked: unknown): Device {
+    if (typeof linked !== 'boolean') throw 'invalid linked'
+    this.registry.setLinked(id, linked)
+    this.linksChanged()
+    return this.describe(id as string)!
+  }
+
+  /** `hub/device/attach/dismiss`: an owner, or the parent it named */
+  dismissAttach(state: State, sender: Sender, id: unknown) {
+    const owner = this.hub.caller(state, sender).owner
+    const named = typeof id === 'string' ? this.registry.device(id)?.attachAsk?.parent : undefined
+    if (!owner && (!named || named !== state.device)) throw 'permissions required'
+    this.registry.dismissAttach(id)
+    this.setNeedsUpdate()
+  }
+
+  /** Links or approvals changed: the copies follow in one save, Hub Network closes what they took */
+  private linksChanged() {
+    this.security.grants.settleCopies()
+    this.hub.connectionsChanged()
+    this.setNeedsUpdate()
   }
 
   /** Makes a connection with a certificate from an approved device a device connection */
-  private attach(state: State) {
+  private placeOnDevice(state: State) {
     const certificate = state.certificate
     if (!certificate) return
     state.device = certificate.deviceId
@@ -211,6 +310,7 @@ export class HubDevices {
     this.devicesState.setNeedsUpdate()
     this.pendingState.setNeedsUpdate()
     this.requestState.setNeedsUpdate()
+    this.attachRequestsState.setNeedsUpdate()
     this.liveDataState.setNeedsUpdate()
   }
 
@@ -226,9 +326,8 @@ export class HubDevices {
   approve(id: string): Device {
     this.registry.approve(id)
     this.gate.forget(request => request.deviceId === id)
-    for (const connection of this.connectionsOf(id)) this.attach(connection.state)
-    this.hub.connectionsChanged()
-    this.setNeedsUpdate()
+    for (const connection of this.connectionsOf(id)) this.placeOnDevice(connection.state)
+    this.linksChanged()
     return this.describe(id)!
   }
 
@@ -239,19 +338,31 @@ export class HubDevices {
     return this.describe(id)!
   }
 
-  /** Forgets a device that still works: it can enrol again, as pending (protocol.md section 8) */
+  /**
+   * Forgets a device that still works: it can enrol again, as pending (protocol.md section 8). Its children came in on its
+   * word, so they go too and ask again.
+   */
   remove(id: string) {
-    this.registry.remove(id)
-    this.cleanUp(id, [])
-    this.onRemoved?.({ id, revoked: false, revokedKeys: [] })
+    const below = this.registry.below(id)
+    for (const device of [id, ...below]) this.registry.remove(device)
+    for (const device of [id, ...below]) {
+      this.cleanUp(device, [])
+      this.onRemoved?.({ id: device, revoked: false, revokedKeys: [] })
+    }
   }
 
-  /** Revokes a lost device and the service keys on it, except `keepServices` (protocol.md section 8) */
+  /**
+   * Revokes a lost device and the service keys on it, except `keepServices` (protocol.md section 8), and everything below
+   * it. Revoking a child leaves its parent alone.
+   */
   revoke(id: string, keepServices: unknown) {
     const keep = Array.isArray(keepServices) ? keepServices.filter(key => typeof key === 'string') : []
-    const revokedKeys = this.registry.revoke(id, keep)
-    this.cleanUp(id, revokedKeys)
-    this.onRemoved?.({ id, revoked: true, revokedKeys })
+    const below = this.registry.below(id)
+    const removals = [id, ...below].map(device => ({ id: device, revokedKeys: this.registry.revoke(device, device === id ? keep : []) }))
+    for (const { id: device, revokedKeys } of removals) {
+      this.cleanUp(device, revokedKeys)
+      this.onRemoved?.({ id: device, revoked: true, revokedKeys })
+    }
   }
 
   /** Closes the device's connections and those of revoked keys, and drops their grants and group memberships */
@@ -335,7 +446,7 @@ export class HubDevices {
     if (!ports && !services.length && !hostSSH) return
     const ssh = device.capabilities?.ssh as { port?: number } | undefined
     const seesSSH = !!ssh && (hostSSH || (ssh.port !== undefined && !!ports?.has(ssh.port)))
-    const { os: _os, arch: _arch, parent: _parent, capabilities: _capabilities, ...visible } = full
+    const { os: _os, arch: _arch, parent: _parent, capabilities: _capabilities, attachedTo: _attachedTo, linked: _linked, ...visible } = full
     return { ...visible, services, ...(seesSSH ? { capabilities: { ssh } } : {}) }
   }
 
@@ -371,6 +482,7 @@ export class HubDevices {
       lastSeen: id === this.selfId ? new Date().toISOString() : device.lastSeen,
       capabilities: device.capabilities,
       services,
+      ...(device.attached ? { attachedTo: device.attached.parent, linked: device.attached.linked === true } : {}),
     }
   }
 
@@ -464,6 +576,12 @@ export class HubDevices {
         if (!state.certificate) throw 'no device certificate'
         return this.requestState.makeIterator(state)
       })
+      .post('hub/device/attach/ask', ({ body, state }) => this.askAttach(state, body?.parent))
+      .stream('hub/device/attach/requests', ({ state }) => this.attachRequestsState.makeIterator(state))
+      .post('hub/device/attach', ({ body, state, sender }) => this.attach(state, sender, body))
+      .post('hub/device/attach/dismiss', ({ body, state, sender }) => this.dismissAttach(state, sender, body?.id))
+      .post('hub/device/detach', ({ body, state, sender }) => this.detach(state, sender, body?.id))
+      .post('hub/device/link', ({ body }) => this.link(body?.id, body?.linked))
     channel
       .stream('hub/devices', ({ state, sender, context }) => {
         this.listCallers.set(state, () => this.hub.caller(state, sender, context))

@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import vectors from './fixtures/device-vectors.json'
 import { Hub, security } from '../src/hub'
-import { deviceId, safetyCode, verifyCertificate, type Certificate } from '../src/devices'
+import { attachSignedData, deviceId, safetyCode, verifyCertificate, type Certificate } from '../src/devices'
 import { certificate, connect, first, freePort, makeKey, token, until, waitFor, type Client, type TestKey } from './helpers'
 
 const { keys } = vectors
@@ -9,6 +9,7 @@ const { keys } = vectors
 describe('device vectors', () => {
   test('device id and safety codes', () => {
     expect(deviceId(keys.device.publicKey)).toBe(keys.device.deviceId)
+    expect(attachSignedData(vectors.attach.hubKey, vectors.attach.parentKey, vectors.attach.childKey, vectors.attach.at)).toBe(vectors.attach.signedData)
     for (const { hubKey, deviceKey, codeValue, code } of vectors.safetyCode.cases) {
       expect(safetyCode(hubKey, deviceKey, codeValue)).toBe(code)
     }

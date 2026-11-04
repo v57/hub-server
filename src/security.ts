@@ -113,9 +113,10 @@ const publicBuiltins = new Set([
 // `hub/net/bind` keeps the proof of its bind kind, `hub/net/node` tells agents where their node is, `hub/pair` makes
 // the holder of the pairing code an owner, `hub/grant/check` limits services to their own paths,
 // `hub/profile/update` labels the caller's own connection, `hub/device/request` answers for its own certificate
-const authBuiltins = new Set(['hub/api/services', 'hub/net/bind', 'hub/net/node', 'hub/pair', 'hub/grant/check', 'hub/profile/update', 'hub/device/request'])
+const authBuiltins = new Set(['hub/api/services', 'hub/net/bind', 'hub/net/node', 'hub/pair', 'hub/grant/check', 'hub/profile/update', 'hub/device/request', 'hub/device/attach/ask'])
 const reporterBuiltins = new Set(['hub/device/describe', 'hub/device/data'])
-const grantBuiltins = new Set(['hub/devices', 'hub/devices/data'])
+// The attach paths check their caller themselves: an owner, or the parent on its own connection
+const grantBuiltins = new Set(['hub/devices', 'hub/devices/data', 'hub/device/attach', 'hub/device/attach/requests', 'hub/device/attach/dismiss', 'hub/device/detach'])
 
 /** Access of a built-in path, undefined for service paths. `own`: `network/*` checks its callers itself. */
 export function builtinAccess(path: string): BuiltinAccess | undefined {
@@ -141,6 +142,8 @@ export interface Caller {
 }
 
 export const ownersGroup = 'owners'
+/** `by` of the grant `HUBLAUNCHER` brings */
+const launcherGrant = 'launcher'
 
 /**
  * A hub error with a code (channel wire v2, protocol.md section 11). The message stays the string older clients
@@ -273,8 +276,10 @@ export class Security implements SecurityInterface {
   requireV1 = true
   /** A store that grants failed to load: only owners may call service paths until an owner sets the mode */
   lockdown = false
-  /** Local mode (protocol.md section 12): `default-allow`, and the launcher key is an owner without being stored */
+  /** Local mode (protocol.md section 12): `default-allow`. Nobody is an owner by it. */
   local = false
+  /** Whether a device has a parent, set by the hub: a child is never an owner, whatever its key or a group says */
+  isChild?: (id: string) => boolean
 
   async load() {
     await Promise.all([
@@ -332,6 +337,13 @@ export class Security implements SecurityInterface {
     const object = parseObject(body?.object)
     return this.grants.add(subject, object, this.asCaller(by).key ?? 'owner')
   }
+  /** `hub/grant/remove`: a copy goes with what it came from, or with its child's link */
+  removeGrant(id: unknown) {
+    const grant = this.grants.grants.find(grant => grant.id === id)
+    if (!grant) throw 'grant not found'
+    if (grant.copyOf) throw 'grant is a copy'
+    this.grants.remove(id)
+  }
   /** Removes grants naming a removed device and drops it from every group */
   removeDevice(id: string) {
     this.grants.removeWhere(({ subject }) => 'device' in subject && subject.device === id)
@@ -347,9 +359,14 @@ export class Security implements SecurityInterface {
     this.local = true
     this.mode = 'default-allow'
   }
-  /** The launcher key in local mode */
-  private isLocalOwner(key: string | undefined): boolean {
-    return this.local && !!key && !!this.launcher && key === this.launcher
+  /**
+   * The launcher's `launcher/*`: a grant to the key named by `HUBLAUNCHER`, never owner rights. A key named before keeps
+   * none of it, and a key revoked with its device gets none back.
+   */
+  settleLauncher(isRevoked: (key: string) => boolean) {
+    const launcher = this.launcher && !isRevoked(this.launcher) ? this.launcher : undefined
+    this.grants.removeWhere(({ subject, by }) => by === launcherGrant && !('key' in subject && subject.key === launcher))
+    if (launcher) this.grants.add({ key: launcher }, { prefix: 'launcher/' }, launcherGrant)
   }
   /** `default-deny` while locked down */
   get effectiveMode(): SecurityMode {
@@ -391,7 +408,7 @@ export class Security implements SecurityInterface {
   /** Every group the key or its device belongs to, `owners` first */
   groups(principal: Principal): string[] {
     const groups = this.members.groupsOf(principal)
-    if (this.isLocalOwner(principal.key) && !groups.includes(ownersGroup)) groups.push(ownersGroup)
+    if (principal.device && this.isChild?.(principal.device)) return groups.filter(group => group !== ownersGroup)
     return groups.sort((a, b) => (a === ownersGroup ? -1 : b === ownersGroup ? 1 : 0))
   }
   /**
@@ -472,11 +489,15 @@ export class Security implements SecurityInterface {
   /** A member of `owners` by key, or by the device the connection is attached to */
   isOwner(who: Who): boolean {
     if (!who) return false
-    if (typeof who === 'string') return this.members.has(ownersGroup, keyMember(who)) || this.isLocalOwner(who)
+    if (typeof who === 'string') return this.members.has(ownersGroup, keyMember(who))
     if (Array.isArray((who as Caller).groups)) return (who as Caller).owner
     const principal = who as Principal
+    if (principal.device && this.isChild?.(principal.device)) return false
+    return this.isStoredOwner(principal)
+  }
+  /** In the owners group by key or device, as stored */
+  isStoredOwner(principal: Principal): boolean {
     return (
-      this.isLocalOwner(principal.key) ||
       (!!principal.key && this.members.has(ownersGroup, keyMember(principal.key))) ||
       (!!principal.device && this.members.has(ownersGroup, deviceMember(principal.device)))
     )

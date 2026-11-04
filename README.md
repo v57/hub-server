@@ -26,7 +26,7 @@ bun i && bun .
 - `-p`, `--port <port>`: listen on a specific port or address
 - `--merge <address>`: will merge api to another Hub.
 - `--owner <id>`: set owner key.
-- `--launcher <id>`: sets launcher key that allowed to host `launcher/*` APIs.
+- `--launcher <id>`: the launcher key, which gets a grant on `launcher/*` and may host them. It's no owner.
 - `--pair`: write a new pairing code, replacing the old one, print it and exit.
 - `--local`: local mode, see below.
 ## Environment
@@ -51,8 +51,9 @@ the wrong codes). A still-valid code survives restarts.
 
 ## Local mode
 `--local` (or `HUB_MODE=local`) is for development on one machine: the hub listens on `127.0.0.1` only (never other
-interfaces), runs `default-allow`, treats the launcher key (`HUBLAUNCHER`) as an owner and makes no pairing code. None of
-this is written to `data/`, so the same hub started normally keeps its stored mode and owners.
+interfaces) and runs `default-allow`, which isn't written to `data/`, so the same hub started normally keeps its stored
+mode. Nobody is an owner by it: the launcher key (`HUBLAUNCHER`) holds a grant on `launcher/` like on any hub, and a
+hub without owners makes a pairing code here too (`hub pair` reads it on this machine).
 
 ## Conformance harness
 `test/conformance/e2e-hub.ts` checks a Hub server over the raw protocol (`Docs/Devices/protocol.md`): hub key and v1

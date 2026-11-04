@@ -125,6 +125,8 @@ const owner = newKey(), svcKey = newKey(), devKey = newKey(), stranger = newKey(
 const hub = await startHub(port, ['--owner', owner.pub])
 const dir = hub.dir
 let pairingHub: Awaited<ReturnType<typeof startHub>> | undefined
+let childHub: Awaited<ReturnType<typeof startHub>> | undefined
+let localHub: Awaited<ReturnType<typeof startHub>> | undefined
 
 let hubKey = ''
 const connect = (headers: () => any, onConnect?: (s: any) => Promise<void>, to = address) =>
@@ -633,9 +635,286 @@ try {
     const result = await failure(connect(() => auth(newKey(), pairingKey, pairingAddress), undefined, pairingAddress).send('hub/pair', { code }))
     assert(result.includes('no pairing code'), `result ${result}`)
   })
+
+  // Child devices (protocol.md section 14): the same results on every server, seen only from outside
+  const childPort = port + 2
+  const childAddress = `ws://127.0.0.1:${childPort}`
+  const childOwnerKey = newKey(), childOwnerDevice = newKey(), launcherKey = newKey()
+  childHub = await startHub(childPort, ['--owner', childOwnerKey.pub, '--launcher', launcherKey.pub])
+  const childHubKey = (await ask(childAddress)).info.key as string
+  const links = connect(async () => ({ ...(await auth(childOwnerKey, childHubKey, childAddress)), device: cert(childOwnerDevice, childOwnerKey, 'owner/test') }), undefined, childAddress)
+  await links.send('hub/api')
+  const member = (extra: Record<string, unknown> = {}) => {
+    const key = newKey(), service = newKey()
+    const client = connect(async () => ({ ...(await auth(service, childHubKey, childAddress)), device: cert(key, service, 'child/test', extra) }), undefined, childAddress)
+    return { key, service, client, id: deviceId(key) }
+  }
+  type Member = ReturnType<typeof member>
+  const attachBody = (parent: Key, child: Key, at = now(), hub = childHubKey) => ({ at, signature: sig(parent, `hubattach1:${hub}:${parent.pub}:${child.pub}:${at}`) })
+  const listDevices = async (): Promise<any[]> => first(links.values('hub/devices'), () => true) as Promise<any[]>
+  const deviceRow = async (id: string) => (await listDevices()).find(device => device.id === id)
+  /** Waits for a row: a new device waits its turn, one a second */
+  async function untilRow(id: string, match: (row: any) => boolean = () => true) {
+    const start = Date.now()
+    while (Date.now() - start < 8000) {
+      const row = await deviceRow(id)
+      if (row && match(row)) return row
+      await wait(100)
+    }
+    throw new Error(`no such device row ${id}`)
+  }
+  const childPending = async (id: string) => {
+    const start = Date.now()
+    while (Date.now() - start < 8000) {
+      const list: any = await first(links.values('hub/devices/pending'), () => true)
+      const found = list.find((row: any) => row.id === id)
+      if (found) return found
+      await wait(100)
+    }
+    throw new Error(`not pending ${id}`)
+  }
+  const askRequest = async (id: string, by: any = links) => {
+    const start = Date.now()
+    while (Date.now() - start < 8000) {
+      const list: any = await first(by.values('hub/device/attach/requests'), () => true)
+      const found = list.find((row: any) => row.id === id)
+      if (found) return found
+      await wait(100)
+    }
+    throw new Error(`no attach request from ${id}`)
+  }
+  const grantsOf = async (id: string): Promise<any[]> => {
+    const list: any = await first(links.values('hub/grants'), () => true)
+    return list.filter((grant: any) => grant.subject?.device === id)
+  }
+  const objects = (grants: any[]) => grants.map(grant => JSON.stringify(grant.object)).sort()
+  const ownerDeviceId = deviceId(childOwnerDevice)
+  async function attachedChild(parent?: Member): Promise<Member> {
+    const child = member()
+    await child.client.send('hub/device/attach/ask', parent ? { parent: parent.id } : {})
+    await askRequest(child.id)
+    if (parent) {
+      await parent.client.send('hub/device/attach', { child: child.id, ...attachBody(parent.key, child.key) })
+      await links.send('hub/device/approve', { id: child.id })
+    } else {
+      await links.send('hub/device/attach', { child: child.id, ...attachBody(childOwnerDevice, child.key) })
+    }
+    await untilRow(child.id, row => row.approved)
+    return child
+  }
+  await untilRow(ownerDeviceId, row => row.approved)
+
+  await check('attach: a declared parent name counts for nothing', async () => {
+    const child = member({ parent: 'Mac Studio' })
+    await child.client.send('hub/api')
+    const row = await childPending(child.id)
+    assert(row.parent === 'Mac Studio', `declared ${row.parent}`)
+    assert(row.attachedTo === undefined, 'attached by a name')
+    await child.client.send('hub/device/attach/ask', {})
+    assert((await childPending(child.id)).attachedTo === undefined, 'attached by asking')
+  })
+  await check('attach: only the parent\'s signature, for this hub and this child, within five minutes', async () => {
+    const child = member()
+    await child.client.send('hub/device/attach/ask', {})
+    const request = await askRequest(child.id)
+    assert(request.key === child.key.pub && request.approved === false, `request ${JSON.stringify(request)}`)
+    assert(request.safetyCode === safetyCode(childHubKey, child.key.pub, request.codeValue), 'safety code')
+    const send = (body: any) => failure(links.send('hub/device/attach', { child: child.id, ...body }))
+    assert((await send(attachBody(newKey(), child.key))).includes('invalid signature'), 'a stranger signed')
+    assert((await send(attachBody(childOwnerDevice, newKey()))).includes('invalid signature'), 'another child')
+    assert((await send(attachBody(childOwnerDevice, child.key, now(), newKey().pub))).includes('invalid signature'), 'another hub')
+    assert((await send(attachBody(childOwnerDevice, child.key, now() - 400))).includes('expired'), 'old signature')
+    assert((await send({})).includes('expired'), 'no signature')
+    assert((await send(attachBody(childOwnerDevice, child.key))) === 'ok', 'real signature')
+    const row = await untilRow(child.id)
+    assert(row.attachedTo === ownerDeviceId && row.linked === false && row.approved === true, `row ${JSON.stringify(row)}`)
+    assert((await send(attachBody(childOwnerDevice, child.key))).includes('already attached'), 'twice')
+  })
+  await check('attach: a device that did not ask can not be taken, and asking needs a certificate', async () => {
+    const child = member()
+    await child.client.send('hub/api')
+    await childPending(child.id)
+    const result = await failure(links.send('hub/device/attach', { child: child.id, ...attachBody(childOwnerDevice, child.key) }))
+    assert(result.includes('no attach request'), result)
+    const plainKey = newKey()
+    const plain = connect(() => auth(plainKey, childHubKey, childAddress), undefined, childAddress)
+    assert((await failure(plain.send('hub/device/attach/ask', {}))).includes('no device certificate'), 'no certificate')
+  })
+  await check('attach: a new child has no grants', async () => {
+    await links.send('hub/grant/add', { subject: { device: ownerDeviceId }, object: { path: 'tools/first' } })
+    const child = await attachedChild()
+    assert((await grantsOf(child.id)).length === 0, 'grants on a new child')
+  })
+  await check('attach: a loop is refused at any depth', async () => {
+    const a = await attachedChild()
+    const b = await attachedChild(a)
+    const c = await attachedChild(b)
+    await links.send('hub/device/detach', { id: a.id })
+    await a.client.send('hub/device/attach/ask', { parent: c.id })
+    await askRequest(a.id)
+    const result = await failure(c.client.send('hub/device/attach', { child: a.id, ...attachBody(c.key, a.key) }))
+    assert(result.includes('loop'), result)
+  })
+  await check('links: only linked grants pass, only to linked children, any depth', async () => {
+    const child = await attachedChild()
+    const grandchild = await attachedChild(child)
+    const grant: any = await links.send('hub/grant/add', { subject: { device: ownerDeviceId }, object: { path: 'tools/linked' } })
+    await links.send('hub/grant/add', { subject: { device: ownerDeviceId }, object: { path: 'tools/unlinked' } })
+    await links.send('hub/grant/link', { id: grant.id, linked: true })
+    assert((await grantsOf(child.id)).length === 0, 'passed to an unlinked child')
+    await links.send('hub/device/link', { id: child.id, linked: true })
+    const copies = await grantsOf(child.id)
+    assert(copies.length === 1 && copies[0].copyOf === grant.id && copies[0].object.path === 'tools/linked', `copies ${JSON.stringify(copies)}`)
+    assert((await grantsOf(grandchild.id)).length === 0, 'passed through an unlinked child')
+    await links.send('hub/device/link', { id: grandchild.id, linked: true })
+    assert(objects(await grantsOf(grandchild.id)).join() === '{"path":"tools/linked"}', 'grandchild')
+    // Unlinking in the middle takes what passed through it
+    await links.send('hub/device/link', { id: child.id, linked: false })
+    assert((await grantsOf(child.id)).length === 0 && (await grantsOf(grandchild.id)).length === 0, 'unlinked child keeps copies')
+    await links.send('hub/device/link', { id: child.id, linked: true })
+    assert((await grantsOf(grandchild.id)).length === 1, 'link back')
+    await links.send('hub/grant/link', { id: grant.id, linked: false })
+    assert((await grantsOf(child.id)).length === 0 && (await grantsOf(grandchild.id)).length === 0, 'unlinked grant stays')
+    await links.send('hub/grant/link', { id: grant.id, linked: true })
+    assert((await grantsOf(grandchild.id)).length === 1, 'linked again')
+    await links.send('hub/grant/remove', { id: grant.id })
+    assert((await grantsOf(child.id)).length === 0 && (await grantsOf(grandchild.id)).length === 0, 'removed grant stays')
+  })
+  await check('links: a copy goes with its grant, and what the owner gave directly stays', async () => {
+    const child = await attachedChild()
+    await links.send('hub/device/link', { id: child.id, linked: true })
+    const source: any = await links.send('hub/grant/add', { subject: { device: ownerDeviceId }, object: { prefix: 'both/' } })
+    await links.send('hub/grant/link', { id: source.id, linked: true })
+    const direct: any = await links.send('hub/grant/add', { subject: { device: child.id }, object: { path: 'only/child' } })
+    const copy = (await grantsOf(child.id)).find(grant => grant.copyOf)
+    assert(copy?.object.prefix === 'both/', 'no copy')
+    assert((await failure(links.send('hub/grant/remove', { id: copy.id }))).includes('copy'), 'removed a copy by hand')
+    assert((await failure(links.send('hub/grant/link', { id: copy.id, linked: true }))) !== 'ok', 'linked a copy')
+    await links.send('hub/grant/remove', { id: source.id })
+    assert((await grantsOf(child.id)).map(grant => grant.id).join() === direct.id, 'direct grant went')
+  })
+  await check('links: an owner adding what a child has by copy makes it direct', async () => {
+    const child = await attachedChild()
+    await links.send('hub/device/link', { id: child.id, linked: true })
+    const source: any = await links.send('hub/grant/add', { subject: { device: ownerDeviceId }, object: { path: 'kept/path' } })
+    await links.send('hub/grant/link', { id: source.id, linked: true })
+    const copy = (await grantsOf(child.id))[0]
+    const direct: any = await links.send('hub/grant/add', { subject: { device: child.id }, object: { path: 'kept/path' } })
+    assert(direct.id === copy.id && direct.copyOf === undefined, `direct ${JSON.stringify(direct)}`)
+    await links.send('hub/grant/remove', { id: source.id })
+    assert((await grantsOf(child.id)).map(grant => grant.id).join() === copy.id, 'the direct grant went')
+    await links.send('hub/grant/remove', { id: copy.id })
+    assert((await grantsOf(child.id)).length === 0, 'the owner can remove it')
+  })
+  await check('links: a group never passes down, and a child is never an owner', async () => {
+    const child = await attachedChild()
+    await links.send('hub/device/link', { id: child.id, linked: true })
+    const group: any = await links.send('hub/grant/add', { subject: { group: 'owners' }, object: { path: 'group/only' } })
+    assert((await failure(links.send('hub/grant/link', { id: group.id, linked: true }))) !== 'ok', 'linked a group grant')
+    assert((await grantsOf(child.id)).length === 0, 'a group grant passed')
+    await links.send('hub/grant/remove', { id: group.id })
+    assert((await failure(child.client.send('hub/key'))).includes('permissions required'), 'child acts as an owner')
+    // An owner can't become a child
+    const another = member()
+    await links.send('hub/group/update/users', { group: 'owners', add: [`device:${another.id}`] })
+    await another.client.send('hub/device/attach/ask', {})
+    await untilRow(another.id)
+    const taken = await failure(links.send('hub/device/attach', { child: another.id, ...attachBody(childOwnerDevice, another.key) }))
+    assert(taken.includes('owner'), taken)
+    await links.send('hub/group/update/users', { group: 'owners', remove: [`device:${another.id}`] })
+    // Added to the group by hand, a child still isn't one
+    await links.send('hub/group/update/users', { group: 'owners', add: [`device:${child.id}`] })
+    assert((await failure(child.client.send('hub/key'))).includes('permissions required'), 'child in the group acts as an owner')
+    await links.send('hub/group/update/users', { group: 'owners', remove: [`device:${child.id}`] })
+  })
+  await check('links: a member\'s device takes only a child that named it, and an owner approves that child', async () => {
+    const parent = member()
+    await parent.client.send('hub/api')
+    await childPending(parent.id)
+    await links.send('hub/device/approve', { id: parent.id })
+    await untilRow(parent.id, row => row.approved)
+    const stranger = member()
+    await stranger.client.send('hub/device/attach/ask', {})
+    await askRequest(stranger.id)
+    const unnamed = await failure(parent.client.send('hub/device/attach', { child: stranger.id, ...attachBody(parent.key, stranger.key) }))
+    assert(unnamed.includes('permissions required'), unnamed)
+    const child = member()
+    await child.client.send('hub/device/attach/ask', { parent: parent.id })
+    await askRequest(child.id)
+    const seen: any = await first(parent.client.values('hub/device/attach/requests'), (list: any) => list.length > 0)
+    assert(seen.map((row: any) => row.id).join() === child.id, `sees ${JSON.stringify(seen)}`)
+    const held = await failure(links.send('hub/device/attach', { child: child.id, ...attachBody(childOwnerDevice, child.key) }))
+    assert(held.includes('another parent'), held)
+    await parent.client.send('hub/device/attach', { child: child.id, ...attachBody(parent.key, child.key) })
+    await links.send('hub/device/approve', { id: child.id })
+    const row = await untilRow(child.id, row => row.approved)
+    assert(row.attachedTo === parent.id, `row ${JSON.stringify(row)}`)
+    assert((await failure(parent.client.send('hub/device/link', { id: child.id, linked: true }))).includes('permissions required'), 'a member linked')
+  })
+  await check('links: a turned down request stays down, and detaching drops copies but not the device', async () => {
+    const asker = member()
+    await asker.client.send('hub/device/attach/ask', {})
+    await askRequest(asker.id)
+    await links.send('hub/device/attach/dismiss', { id: asker.id })
+    await asker.client.send('hub/device/attach/ask', {})
+    const list: any = await first(links.values('hub/device/attach/requests'), () => true)
+    assert(!list.some((row: any) => row.id === asker.id), 'asked again')
+    const child = await attachedChild()
+    await links.send('hub/device/link', { id: child.id, linked: true })
+    const source: any = await links.send('hub/grant/add', { subject: { device: ownerDeviceId }, object: { path: 'detach/me' } })
+    await links.send('hub/grant/link', { id: source.id, linked: true })
+    assert((await grantsOf(child.id)).length === 1, 'no copy')
+    await links.send('hub/device/detach', { id: child.id })
+    assert((await grantsOf(child.id)).length === 0, 'kept its copy')
+    const row = await deviceRow(child.id)
+    assert(row.approved === true && row.attachedTo === undefined, `row ${JSON.stringify(row)}`)
+    await links.send('hub/grant/remove', { id: source.id })
+  })
+  await check('revoke: a parent takes everything below it, a child leaves its parent alone', async () => {
+    const parent = await attachedChild()
+    const child = await attachedChild(parent)
+    const grandchild = await attachedChild(child)
+    await links.send('hub/device/revoke', { id: grandchild.id })
+    assert((await deviceRow(grandchild.id))?.revoked, 'grandchild stays')
+    assert(!(await deviceRow(child.id))?.revoked && !(await deviceRow(parent.id))?.revoked, 'revoked upward')
+    const another = await attachedChild(parent)
+    await links.send('hub/device/revoke', { id: parent.id })
+    for (const device of [parent, child, another]) assert((await deviceRow(device.id))?.revoked, `${device.id} stays`)
+    assert(!(await deviceRow(ownerDeviceId))?.revoked, 'revoked upward')
+    assert(!(await opens(await auth(another.service, childHubKey, childAddress), childAddress)), 'a revoked child\'s key connects')
+  })
+  await check('remove: its children go too and ask again', async () => {
+    const parent = await attachedChild()
+    const child = await attachedChild(parent)
+    await links.send('hub/device/remove', { id: parent.id })
+    assert(!(await deviceRow(parent.id)) && !(await deviceRow(child.id)), 'still listed')
+  })
+  await check('the launcher key has launcher/* by a grant and is no owner', async () => {
+    const launcher = connect(() => auth(launcherKey, childHubKey, childAddress), undefined, childAddress)
+    assert((await failure(launcher.send('hub/key'))).includes('permissions required'), 'the launcher acts as an owner')
+    const grants: any = await first(links.values('hub/grants'), () => true)
+    const held = grants.filter((grant: any) => grant.subject?.key === launcherKey.pub)
+    assert(held.length === 1 && held[0].object.prefix === 'launcher/', `grants ${JSON.stringify(held)}`)
+  })
+  const localPort = port + 3
+  const localAddress = `ws://127.0.0.1:${localPort}`
+  const localLauncher = newKey()
+  localHub = await startHub(localPort, ['--local', '--launcher', localLauncher.pub])
+  await check('local mode: the launcher is no owner, and the first owner pairs', async () => {
+    const info = (await ask(localAddress)).info
+    assert(info.mode === 'default-allow', `mode ${info.mode}`)
+    const client = connect(() => auth(localLauncher, info.key, localAddress), undefined, localAddress)
+    assert((await failure(client.send('hub/key'))).includes('permissions required'), 'the launcher acts as an owner')
+    const code = await pairingCode(localHub!)
+    const pairer = newKey()
+    const paired: any = await connect(() => auth(pairer, info.key, localAddress), undefined, localAddress).send('hub/pair', { code })
+    assert(paired?.owner === true, `paired ${JSON.stringify(paired)}`)
+  })
 } finally {
   hub.proc.kill()
   pairingHub?.proc.kill()
+  childHub?.proc.kill()
+  localHub?.proc.kill()
   const failed = results.filter(r => !r[1])
   for (const [n, ok, err] of results) console.log(`${ok ? 'PASS' : 'FAIL'} ${n}${err ? ` — ${err}` : ''}`)
   console.log(`\n${results.length - failed.length}/${results.length} passed (hub data in ${dir})`)
