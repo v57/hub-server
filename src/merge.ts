@@ -2,7 +2,9 @@ import type { Hub } from './hub'
 import { sign } from './keychain'
 import { settings } from './settings'
 import { FreshState } from './fresh-state'
-import type { Sender } from 'channel/client'
+import { Channel, type Sender } from 'channel/client'
+import { randomBytes } from 'node:crypto'
+import { verifyHubProof } from './nonces'
 
 export class HubMerger {
   connections = new Map<string, Connection>()
@@ -99,9 +101,9 @@ export class ServiceUpdateContext {
 
 export class Connection {
   address: string
-  channel?
+  channel?: any
   error?: string
-  /** The other hub's key from its `hub/info`, unverified. Once known, tokens are bound to it (v1). */
+  /** The other hub's key, pinned once it proved it through `hub/info`. Tokens are bound to it. */
   hubKey?: string
   sender?: Sender
   constructor(address: string, hub: Hub, merge: boolean) {
@@ -114,11 +116,9 @@ export class Connection {
     }
     const t = this
     this.channel = hub.channel.connect(this.address, {
-      headers: async () =>
-        t.hubKey ? { auth: await sign(10, t.hubKey), v: '1' } : { auth: await sign(), v: '0' },
+      headers: () => t.headers(),
       async onConnect(sender) {
         t.sender = sender
-        if (!t.hubKey) await t.learnHubKey(sender)
         if (merge) {
           const add = Object.keys(hub.services.storage).filter(allows)
           if (!add.length) return
@@ -135,14 +135,38 @@ export class Connection {
       },
     })
   }
-  /** Pins the other hub's key for the next connect. hub-lite has no `hub/info` and stays on v0. */
-  private async learnHubKey(sender: Sender) {
+  /**
+   * Headers for the next attempt (protocol.md section 2): asks the other hub for a challenge on an anonymous
+   * connection, pins its key once it proved it, and signs a token for that challenge alone. Waits while the other hub
+   * doesn't answer, or doesn't prove the key it claims, since a token is never sent to one that hasn't.
+   */
+  private async headers(): Promise<Record<string, string>> {
+    while (this.channel !== null) {
+      try {
+        const nonce = randomBytes(32).toString('base64url')
+        const info = await this.askInfo(nonce)
+        if (!verifyHubProof(info, nonce)) throw 'no proof of its key'
+        if (this.hubKey && info.key !== this.hubKey) throw `key changed, pinned ${this.hubKey}`
+        if (!this.hubKey) {
+          this.hubKey = info.key
+          settings.setMergeKey(this.address, info.key)
+        }
+        this.error = undefined
+        return { auth: await sign(info.key, info.challenge), v: '1' }
+      } catch (error) {
+        this.error = `${error}`
+        await Bun.sleep(5000)
+      }
+    }
+    return {}
+  }
+  private async askInfo(nonce: string): Promise<any> {
+    const probe = new Channel<any>().connect(this.address) as any
     try {
-      const info = await sender.send('hub/info', undefined, { timeout: 10 })
-      if (typeof info?.key !== 'string' || !info.key) return
-      this.hubKey = info.key
-      settings.setMergeKey(this.address, info.key)
-    } catch {}
+      return await probe.send('hub/info', { nonce }, { timeout: 10 })
+    } finally {
+      probe.stop()
+    }
   }
   async update(add: string[], remove: string[]) {
     try {
@@ -153,7 +177,7 @@ export class Connection {
   }
   disconnect() {
     this.channel?.stop()
-    delete this.channel
+    this.channel = null
   }
   get status(): ConnectionStatus {
     return {

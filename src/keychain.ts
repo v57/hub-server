@@ -3,12 +3,11 @@ import { securePrivate, writeAtomically } from './settings'
 
 let loadedKey: Promise<string> | undefined
 
-/** An `auth` token. With `hubKey` it's a v1 token that only works on that hub (send `v: "1"`). */
-export async function sign(expires: number = 10, hubKey?: string) {
+/** A v1 `auth` token for that hub and its one-time `challenge` from `hub/info` (send `v: "1"`). */
+export async function sign(hubKey: string, nonce: string, expires: number = 30) {
   const data = `${Math.round(new Date().getTime() / 1000) + expires}`
-  const signed = hubKey ? `hub1:${hubKey}:${data}` : data
-  const [key, signature] = await Promise.all([loadKey(), signChallenge(signed)])
-  return `key.${getPublicKey(key)}.${signature}.${data}`
+  const [key, signature] = await Promise.all([loadKey(), signChallenge(`hub1:${hubKey}:${nonce}:${data}`)])
+  return `key.${getPublicKey(key)}.${signature}.${data}.${nonce}`
 }
 export async function signChallenge(data: string | Uint8Array): Promise<string> {
   return makeSignature(await loadKey(), data)

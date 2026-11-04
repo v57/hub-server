@@ -74,7 +74,7 @@ describe('devices on the hub', () => {
   let hub: Hub
   const clients: Client[] = []
   const v1 = (key: TestKey, device?: TestKey, fields?: Record<string, unknown>) => () => ({
-    auth: token(key, security.hubKey),
+    auth: token(key, security.hubKey, security.nonces),
     v: '1',
     ...(device ? { device: certificate(device, key, fields) } : {}),
   })
@@ -118,7 +118,7 @@ describe('devices on the hub', () => {
     const service = makeKey()
     const id = deviceId(device.key)
     const caller = client(v1(service, device, { deviceName: 'Phone', platform: 'ios', instance: 'app' }))
-    expect(await caller.sender.send('hub/info')).toMatchObject({ protocol: 1 })
+    expect(await caller.sender.send('hub/info')).toMatchObject({ protocol: 2 })
     expect(await pendingHas(id, true)).toMatchObject({
       key: device.key,
       name: 'Phone',
@@ -153,9 +153,14 @@ describe('devices on the hub', () => {
     const device = makeKey()
     const service = makeKey()
     security.addOwner(device.key)
-    const c = client(() => ({ auth: token(service), v: '0', device: certificate(device, service, { deviceName: 'Old SDK' }) }))
-    await c.sender.send('hub/info')
-    expect(await listed(deviceId(device.key), d => d?.online)).toMatchObject({ name: 'Old SDK', approved: true })
+    security.setMode({ requireV1: false })
+    try {
+      const c = client(() => ({ auth: token(service), v: '0', device: certificate(device, service, { deviceName: 'Old SDK' }) }))
+      await c.sender.send('hub/info')
+      expect(await listed(deviceId(device.key), d => d?.online)).toMatchObject({ name: 'Old SDK', approved: true })
+    } finally {
+      security.setMode({ requireV1: true })
+    }
   })
 
   test('an owner device makes every service on it an owner', async () => {

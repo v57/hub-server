@@ -11,7 +11,7 @@ describe('calls waiting for a provider', () => {
   let hub: Hub
   const clients: Client[] = []
   const client = (key: TestKey) => {
-    const c = connect(port, () => ({ auth: token(key, security.hubKey), v: '1' }))
+    const c = connect(port, () => ({ auth: token(key, security.hubKey, security.nonces), v: '1' }))
     clients.push(c)
     return c
   }

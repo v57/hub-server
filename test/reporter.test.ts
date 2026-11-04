@@ -14,7 +14,7 @@ describe('device reporter, data and selection', () => {
   const clients: Client[] = []
   const client = (key: TestKey, withDevice?: TestKey, instance = 'test') => {
     const c = connect(port, () => ({
-      auth: token(key, security.hubKey),
+      auth: token(key, security.hubKey, security.nonces),
       v: '1',
       ...(withDevice ? { device: certificate(withDevice, key, { instance, deviceName: 'Studio' }) } : {}),
     }))

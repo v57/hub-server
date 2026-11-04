@@ -33,6 +33,8 @@ export type SecurityMode = 'default-allow' | 'default-deny'
 export interface SecuritySettings {
   mode: SecurityMode
   requireV1: boolean
+  /** An owner turned `requireV1` off. Stores from before auth v2 hold `requireV1: false` that nobody chose. */
+  allowV0?: true
 }
 interface ApiSettings {
   loadBalancer?: LoadBalancer
@@ -44,7 +46,7 @@ export class HubSettings {
     proxies: [],
     api: {},
     pendingLimit: 0,
-    security: { mode: 'default-deny', requireV1: false },
+    security: { mode: 'default-deny', requireV1: true },
     mergeKeys: {},
   }
   storage: Storage
@@ -65,7 +67,8 @@ export class HubSettings {
         this.storedMode = data.security?.mode !== undefined
         this.data.security = {
           mode: data.security?.mode === 'default-deny' ? 'default-deny' : 'default-allow',
-          requireV1: data.security?.requireV1 === true,
+          requireV1: data.security?.allowV0 !== true,
+          ...(data.security?.allowV0 === true ? { allowV0: true as const } : {}),
         }
       },
     )
@@ -99,6 +102,8 @@ export class HubSettings {
     if (typeof security.requireV1 === 'boolean') {
       changed ||= this.data.security.requireV1 !== security.requireV1
       this.data.security.requireV1 = security.requireV1
+      if (security.requireV1) delete this.data.security.allowV0
+      else this.data.security.allowV0 = true
     }
     if (changed) this.storage.save()
   }

@@ -1,4 +1,4 @@
-import { generateKeyPairSync, sign, type KeyObject } from 'node:crypto'
+import { generateKeyPairSync, randomBytes, sign, type KeyObject } from 'node:crypto'
 import { Channel } from 'channel/client'
 import type { Sender } from 'channel/client'
 
@@ -12,11 +12,23 @@ export function makeKey(): TestKey {
   return { key: publicKey.export({ format: 'der', type: 'spki' }).toString('base64'), privateKey }
 }
 
-/** An `auth` token, v1 when `hubKey` is given */
-export function token(key: TestKey, hubKey?: string, expiresIn = 60): string {
+/** An `auth` token: v0 without `hubKey`, v1 for `hubKey` over a challenge from the hub's `hub/info`, or `nonces` here */
+export function token(key: TestKey, hubKey?: string, nonces?: { issue(): string } | string, expiresIn = 30): string {
   const time = `${Math.round(Date.now() / 1000) + expiresIn}`
-  const signed = hubKey ? `hub1:${hubKey}:${time}` : time
-  return `key.${key.key}.${sign(null, Buffer.from(signed), key.privateKey).toString('base64')}.${time}`
+  const sig = (text: string) => sign(null, Buffer.from(text), key.privateKey).toString('base64')
+  if (!hubKey) return `key.${key.key}.${sig(time)}.${time}`
+  const nonce = typeof nonces === 'string' ? nonces : nonces!.issue()
+  return `key.${key.key}.${sig(`hub1:${hubKey}:${nonce}:${time}`)}.${time}.${nonce}`
+}
+
+/** A challenge from the hub at `port`, asked on an anonymous connection */
+export async function challenge(port: number): Promise<{ key: string; challenge: string; proof?: string; [k: string]: unknown }> {
+  const probe = new Channel<any>().connect(`ws://localhost:${port}`) as any
+  try {
+    return await probe.send('hub/info', { nonce: randomBytes(32).toString('base64url') })
+  } finally {
+    probe.stop()
+  }
 }
 
 export interface Client {
@@ -25,7 +37,7 @@ export interface Client {
 }
 
 /** Connects to the hub, `headers` evaluated at connect */
-export function connect(port: number, headers: () => Record<string, string> = () => ({})): Client {
+export function connect(port: number, headers: () => Record<string, string> | Promise<Record<string, string>> = () => ({})): Client {
   const channel = new Channel<any>()
   const sender = channel.connect(`ws://localhost:${port}`, { headers }) as any
   return { sender, channel }

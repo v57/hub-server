@@ -7,7 +7,7 @@
 // write the code to data/pairing-code), per protocol.md section 12. `<command> --pair` in the same directory must print
 // a new code and exit while the server runs, and the server must take that code at once.
 import { Channel } from 'channel/client'
-import { createHash, createPrivateKey, generateKeyPairSync, sign } from 'node:crypto'
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, sign, verify } from 'node:crypto'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -28,11 +28,33 @@ function newKey(): Key {
 const sig = (k: Key, s: string) => sign(null, Buffer.from(s), k.priv).toString('base64')
 const now = () => Math.floor(Date.now() / 1000)
 const deviceId = (k: Key) => createHash('sha256').update(Buffer.from(k.pub, 'base64')).digest('hex').slice(0, 32)
-function auth(k: Key, hubKey?: string) {
-  const exp = now() + 60
-  return hubKey
-    ? { v: '1', auth: `key.${k.pub}.${sig(k, `hub1:${hubKey}:${exp}`)}.${exp}` }
-    : { v: '0', auth: `key.${k.pub}.${sig(k, `${exp}`)}.${exp}` }
+/** Anonymous `hub/info` with a client nonce (protocol.md section 2) */
+async function ask(to: string, nonce = randomBytes(32).toString('base64url')) {
+  const probe = new Channel<any>().connect(to) as any
+  try {
+    return { nonce, info: await probe.send('hub/info', { nonce }, { timeout: 5 }) }
+  } finally {
+    probe.stop?.()
+  }
+}
+const proofHolds = (key: string, nonce: string, proof: string) =>
+  verify(null, Buffer.from(`hubinfo1:${key}:${nonce}`), createPublicKey({ key: Buffer.from(key, 'base64'), format: 'der', type: 'spki' }), Buffer.from(proof, 'base64'))
+const v1Token = (k: Key, hubKey: string, nonce: string, exp = now() + 30) => ({ v: '1', auth: `key.${k.pub}.${sig(k, `hub1:${hubKey}:${nonce}:${exp}`)}.${exp}.${nonce}` })
+/** v1 headers over a fresh challenge from the server at `to` */
+async function auth(k: Key, hubKey: string, to = address) {
+  return v1Token(k, hubKey, (await ask(to)).info.challenge)
+}
+/** Whether a connection with these headers opens and answers */
+async function opens(headers: any, to = address, ms = 2000): Promise<boolean> {
+  const c = new Channel<any>().connect(to, { headers: () => headers }) as any
+  try {
+    await Promise.race([c.send('hub/info'), wait(ms).then(() => { throw new Error('no answer') })])
+    return true
+  } catch {
+    return false
+  } finally {
+    c.stop?.()
+  }
 }
 function cert(device: Key, service: Key, instance: string, extra: Record<string, unknown> = {}) {
   const iat = now()
@@ -106,12 +128,48 @@ try {
   const anon = connect(() => ({}))
   await check('hub/info public', async () => {
     const info = await anon.send('hub/info')
-    assert(info?.key && info.protocol === 1, `bad info ${JSON.stringify(info)}`)
+    assert(info?.key && info.protocol === 2, `bad info ${JSON.stringify(info)}`)
     assert(info.mode === 'default-deny', `fresh hub mode ${info.mode}`)
+    assert(typeof info.challenge === 'string' && info.proof === undefined, `bad challenge ${JSON.stringify(info)}`)
     hubKey = info.key
   })
+  await check('hub/info proves the key over the client nonce', async () => {
+    const { nonce, info } = await ask(address)
+    assert(info.key === hubKey && typeof info.proof === 'string', `no proof ${JSON.stringify(info)}`)
+    assert(proofHolds(hubKey, nonce, info.proof), 'proof does not verify')
+    assert(!proofHolds(hubKey, nonce + 'x', info.proof), 'proof verifies for another nonce')
+    let failed = false
+    try { await anon.send('hub/info', { nonce: 'short' }) } catch { failed = true }
+    assert(failed, 'invalid client nonce accepted')
+  })
+  await check('v0 and nonce-less v1 tokens are refused by default', async () => {
+    const exp = now() + 60
+    assert(!(await opens({ v: '0', auth: `key.${owner.pub}.${sig(owner, `${exp}`)}.${exp}` })), 'v0 accepted')
+    assert(!(await opens({ v: '1', auth: `key.${owner.pub}.${sig(owner, `hub1:${hubKey}:${exp}`)}.${exp}` })), 'v1 without nonce accepted')
+  })
+  await check('a v1 token works once', async () => {
+    const headers = await auth(owner, hubKey)
+    assert(await opens(headers), 'first use refused')
+    assert(!(await opens(headers)), 'replayed token accepted')
+    const { info } = await ask(address)
+    const other = v1Token(stranger, hubKey, info.challenge)
+    assert(await opens(other), 'fresh challenge refused')
+    assert(!(await opens(v1Token(owner, hubKey, info.challenge))), 'used nonce accepted under another key')
+  })
+  await check('a made-up or expired-looking nonce is refused', async () => {
+    assert(!(await opens(v1Token(owner, hubKey, Buffer.alloc(40, 7).toString('base64url')))), 'forged nonce accepted')
+    assert(!(await opens(v1Token(owner, hubKey, 'a.b'))), 'malformed nonce accepted')
+  })
+  await check('a token over a challenge expires within a minute', async () => {
+    const { info } = await ask(address)
+    assert(!(await opens(v1Token(owner, hubKey, info.challenge, now() + 300))), 'long token accepted')
+  })
   const ownerC = connect(() => auth(owner, hubKey))
-  await check('owner v1 connect + owner API', async () => { await ownerC.send('hub/security/mode/set', { requireV1: false }) })
+  await check('owner v1 connect + owner API', async () => {
+    const mode = await first(ownerC.values('hub/security/mode'), (m: any) => !!m)
+    assert((mode as any).requireV1 === true, 'requireV1 is off on a new hub')
+    await ownerC.send('hub/security/mode/set', { requireV1: true })
+  })
   await check('v1 token for another hub is refused', async () => {
     const other = newKey().pub
     const bad = connect(() => auth(stranger, other))
@@ -126,7 +184,7 @@ try {
   let lastContext: any
   svcChannel.post('e2e/whoami', ({ context }: any) => { lastContext = context; return context?.hub?.caller ?? null })
   const svc = svcChannel.connect(address, {
-    headers: () => ({ ...auth(svcKey, hubKey), device: cert(devKey, svcKey, 'e2e/echo') }),
+    headers: async () => ({ ...(await auth(svcKey, hubKey)), device: cert(devKey, svcKey, 'e2e/echo') }),
     async onConnect(s) { await s.send('hub/service/update', { services: [{ path: 'e2e/whoami' }], reporter: true }) },
   })
   await wait(800)
@@ -293,7 +351,7 @@ try {
     assert(list.find(d => d.id === deviceId(devKey)).revoked === true, 'device not marked revoked')
   })
   await check('revoked key is refused at connect', async () => {
-    const again = new Channel<any>().connect(address, { headers: () => ({ ...auth(svcKey, hubKey), device: cert(devKey, svcKey, 'e2e/echo') }) })
+    const again = new Channel<any>().connect(address, { headers: async () => ({ ...(await auth(svcKey, hubKey)), device: cert(devKey, svcKey, 'e2e/echo') }) })
     let refused = false
     try { await Promise.race([again.send('hub/info'), wait(2500).then(() => { throw new Error('timeout') })]) } catch { refused = true }
     assert(refused, 'revoked service key could connect')
@@ -317,7 +375,7 @@ try {
     pairingKey = info.key
   })
   const pairer = newKey(), pairerDevice = newKey()
-  const pairerC = connect(() => ({ ...auth(pairer, pairingKey), device: cert(pairerDevice, pairer, 'e2e/pair') }), undefined, pairingAddress)
+  const pairerC = connect(async () => ({ ...(await auth(pairer, pairingKey, pairingAddress)), device: cert(pairerDevice, pairer, 'e2e/pair') }), undefined, pairingAddress)
   const failure = (promise: Promise<unknown>) => promise.then(() => 'ok', (e: any) => String(e?.message ?? e))
   const wrong = (c: string) => (c[0] === 'A' ? 'B' : 'A') + c.slice(1)
   await check('hub/pair refuses anonymous callers', async () => {
@@ -361,7 +419,7 @@ try {
     await first(pairerC.values('hub/connections'), () => true, 2500)
   })
   await check('the code works once', async () => {
-    const result = await failure(connect(() => auth(newKey(), pairingKey), undefined, pairingAddress).send('hub/pair', { code }))
+    const result = await failure(connect(() => auth(newKey(), pairingKey, pairingAddress), undefined, pairingAddress).send('hub/pair', { code }))
     assert(result.includes('no pairing code'), `result ${result}`)
   })
 } finally {

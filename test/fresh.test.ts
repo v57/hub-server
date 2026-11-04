@@ -10,7 +10,7 @@ describe('one-shot reads of hub streams', () => {
   const clients: Client[] = []
   const client = (key: TestKey, device?: TestKey) => {
     const c = connect(port, () => ({
-      auth: token(key, security.hubKey),
+      auth: token(key, security.hubKey, security.nonces),
       v: '1',
       ...(device ? { device: certificate(device, key) } : {}),
     }))
@@ -39,8 +39,9 @@ describe('one-shot reads of hub streams', () => {
     expect((await first<any[]>(owners, 'hub/grants')).some(g => g.id === grant.id)).toBe(true)
     await owners.sender.send('hub/group/create', { name: 'Anna', person: true })
     expect((await first<any[]>(owners, 'hub/groups')).find(g => g.id === 'Anna')).toMatchObject({ person: true })
-    await owners.sender.send('hub/security/mode/set', { requireV1: true })
     expect(await first(owners, 'hub/security/mode')).toMatchObject({ requireV1: true })
     await owners.sender.send('hub/security/mode/set', { requireV1: false })
+    expect(await first(owners, 'hub/security/mode')).toMatchObject({ requireV1: false })
+    await owners.sender.send('hub/security/mode/set', { requireV1: true })
   })
 })

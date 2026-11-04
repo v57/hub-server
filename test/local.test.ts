@@ -25,7 +25,7 @@ describe('a hub in local mode', () => {
   let hub: Hub
   const clients: Client[] = []
   const client = (key?: TestKey) => {
-    const c = connect(port, () => (key ? { auth: token(key, security.hubKey), v: '1' } : {}))
+    const c = connect(port, () => (key ? { auth: token(key, security.hubKey, security.nonces), v: '1' } : {}))
     clients.push(c)
     return c
   }

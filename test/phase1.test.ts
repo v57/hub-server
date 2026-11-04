@@ -7,10 +7,12 @@ import vectors from './fixtures/device-vectors.json'
 import { Hub, security, forwardedContext } from '../src/hub'
 import { HubSettings } from '../src/settings'
 import { builtinAccess, Security } from '../src/security'
+import type { TokenNonces } from '../src/nonces'
 import { connect, freePort, makeKey, token, waitFor, type Client } from './helpers'
 
+const acceptingNonces = { isValid: () => true, consume: () => true } as unknown as TokenNonces
 const verifyToken = (security: Security, header: string, version?: string, hubKey?: string) =>
-  security.keys.verify(header, security.whitelist, { version, hubKey })
+  security.keys.verify(header, security.whitelist, { version, hubKey, nonces: acceptingNonces })
 
 describe('auth token vectors', () => {
   const { auth, keys } = vectors
@@ -28,7 +30,7 @@ describe('auth token vectors', () => {
     expect(atExpiry(() => verifyToken(s, auth.v0.header, '0'))).toBe(keys.service.publicKey)
     expect(atExpiry(() => verifyToken(s, auth.v0.header))).toBe(keys.service.publicKey)
   })
-  test('v1 signs hub1:<hub key>:<expiry>', () => {
+  test('v1 signs hub1:<hub key>:<nonce>:<expiry>', () => {
     const s = new Security()
     expect(atExpiry(() => verifyToken(s, auth.v1.header, '1', keys.hub.publicKey))).toBe(keys.service.publicKey)
     const key = createPublicKey({ key: Buffer.from(keys.service.publicKey, 'base64'), format: 'der', type: 'spki' })
@@ -40,7 +42,7 @@ describe('auth token vectors', () => {
   })
   test('a v0 token sent as v1 is refused', () => {
     const s = new Security()
-    expect(() => atExpiry(() => verifyToken(s, auth.v0.header, '1', keys.hub.publicKey))).toThrow('invalid signature')
+    expect(() => atExpiry(() => verifyToken(s, auth.v0.header, '1', keys.hub.publicKey))).toThrow('invalid key')
   })
   test('other versions are refused', () => {
     const s = new Security()
@@ -86,6 +88,24 @@ describe('security mode migration', () => {
     writeFileSync(path, JSON.stringify({ security: { mode: 'default-deny', requireV1: true } }))
     const settings = await new HubSettings(path).load()
     expect(settings.data.security).toEqual({ mode: 'default-deny', requireV1: true })
+  })
+  test('requireV1: false from before auth v2 counts as unset', async () => {
+    const path = join(dir(), 'hub.json')
+    writeFileSync(path, JSON.stringify({ security: { mode: 'default-allow', requireV1: false } }))
+    const settings = await new HubSettings(path).load()
+    expect(settings.data.security.requireV1).toBe(true)
+  })
+  test('an owner turning requireV1 off is kept, and on again', async () => {
+    const path = join(dir(), 'hub.json')
+    const settings = await new HubSettings(path).load()
+    expect(settings.data.security.requireV1).toBe(true)
+    settings.setSecurity({ requireV1: false })
+    await settings.storage.write()
+    const again = await new HubSettings(path).load()
+    expect(again.data.security.requireV1).toBe(false)
+    again.setSecurity({ requireV1: true })
+    await again.storage.write()
+    expect((await new HubSettings(path).load()).data.security.requireV1).toBe(true)
   })
   test('a corrupt hub.json is default-deny', async () => {
     const path = join(dir(), 'hub.json')
@@ -168,7 +188,7 @@ describe('hub', () => {
   let hub: Hub
   const clients: Client[] = []
   const received: any[] = []
-  const v1 = (key: typeof owner) => () => ({ auth: token(key, security.hubKey), v: '1' })
+  const v1 = (key: typeof owner) => () => ({ auth: token(key, security.hubKey, security.nonces), v: '1' })
   const client = (headers?: () => Record<string, string>) => {
     const c = connect(port, headers)
     clients.push(c)
@@ -199,7 +219,7 @@ describe('hub', () => {
 
   test('hub/info is public and returns the hub key', async () => {
     const info = await client().sender.send('hub/info')
-    expect(info).toEqual({ key: security.hubKey, protocol: 1, pro: true, mode: 'default-deny' })
+    expect(info).toEqual({ key: security.hubKey, protocol: 2, pro: true, mode: 'default-deny', challenge: expect.any(String) })
   })
   test('a v1 token bound to this hub connects', async () => {
     expect(await client(v1(user)).sender.send('hub/info')).toMatchObject({ key: security.hubKey })
@@ -264,7 +284,7 @@ describe('hub', () => {
     }
     await expect(values(client(v1(user)), 'hub/connections')).rejects.toThrow('permissions required')
     await expect(values(client(), 'hub/group/list')).rejects.toThrow('permissions required')
-    expect(await values(client(v1(owner)), 'hub/security/mode')).toEqual({ mode: 'default-deny', requireV1: false })
+    expect(await values(client(v1(owner)), 'hub/security/mode')).toEqual({ mode: 'default-deny', requireV1: true })
   })
   test('auth built-ins need a key', async () => {
     const values = async (c: Client) => {
@@ -284,15 +304,9 @@ describe('hub', () => {
     }
   })
   test('requireV1 refuses new v0 connections', async () => {
-    const owners = client(v1(owner))
-    await owners.sender.send('hub/security/mode/set', { requireV1: true })
-    try {
-      const v0 = client(() => ({ auth: token(user), v: '0' }))
-      await expect(v0.sender.send('hub/info')).rejects.toThrow('disconnected')
-      expect(await client(v1(user)).sender.send('hub/info')).toMatchObject({ key: security.hubKey })
-    } finally {
-      await owners.sender.send('hub/security/mode/set', { requireV1: false })
-    }
+    const v0 = client(() => ({ auth: token(user), v: '0' }))
+    await expect(v0.sender.send('hub/info')).rejects.toThrow('disconnected')
+    expect(await client(v1(user)).sender.send('hub/info')).toMatchObject({ key: security.hubKey })
   })
   test('a merged hub learns this hub key and binds its token to it', async () => {
     const connection = hub.merger
@@ -312,7 +326,7 @@ describe('hub', () => {
     security.host.allow(hubKey, ['merged/echo'])
     security.host.allow(service.key, ['merged/echo'])
     security.call.allow(hubKey, ['merged/echo'])
-    const provider = connect(childPort, () => ({ auth: token(service, hubKey), v: '1' }))
+    const provider = connect(childPort, () => ({ auth: token(service, hubKey, security.nonces), v: '1' }))
     clients.push(provider)
     provider.channel.post('merged/echo', ({ context }) => context)
     await provider.sender.send('hub/service/update', { services: [{ path: 'merged/echo' }] })

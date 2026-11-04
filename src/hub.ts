@@ -3,7 +3,8 @@ import 'channel/client'
 import { LazyStates } from 'channel/more'
 import { HubMerger, ServiceUpdateContext } from './merge.ts'
 import { settings } from './settings.ts'
-import { publicKey } from './keychain.ts'
+import { publicKey, signChallenge } from './keychain.ts'
+import { hubInfoSignedData, isClientNonce } from './nonces.ts'
 import * as LoadBalancer from './load balancers.ts'
 import type { Cancellable } from 'channel/channel'
 import { HubError, Security, builtinAccess, deviceMember, keyMember, ownersGroup, type Caller, type Principal } from './security.ts'
@@ -188,6 +189,10 @@ export class Hub {
 
     // Built-in APIs by access class (protocol.md section 7); service paths are checked when forwarded
     this.channel.use((ctx, next) => {
+      // A known client's way to its challenge: on a whitelisted hub an anonymous connection can do nothing else
+      if (ctx.path !== 'hub/info' && !ctx.state.key && security.whitelist.enforced && !this.merger.connectionFor(ctx.sender)) {
+        throw 'hub is not available'
+      }
       if (builtinAccess(ctx.path)) security.checkBuiltin(this.caller(ctx.state, ctx.sender, ctx.context), ctx.path)
       return next()
     })
@@ -199,7 +204,18 @@ export class Hub {
     }
     this.devices.register(this.channel)
     this.channel
-      .post('hub/info', () => ({ key: security.hubKey, protocol: 1, pro: true, mode: security.effectiveMode }))
+      .post('hub/info', async ({ body }) => {
+        const nonce = body?.nonce
+        if (nonce !== undefined && !isClientNonce(nonce)) throw 'invalid nonce'
+        return {
+          key: security.hubKey,
+          protocol: 2,
+          pro: true,
+          mode: security.effectiveMode,
+          challenge: security.nonces.issue(),
+          ...(nonce === undefined ? {} : { proof: await signChallenge(hubInfoSignedData(security.hubKey!, nonce)) }),
+        }
+      })
       .post('hub/pair', async ({ body, state, sender }) => {
         if (!state.key || this.merger.connectionFor(sender)) throw 'unauthorized'
         await this.pairing.verify(body?.code)
@@ -530,6 +546,8 @@ export class Hub {
             version: headers['v'],
             hubKey: security.hubKey,
             requireV1: security.requireV1,
+            nonces: security.nonces,
+            anonymousAllowed: true,
           })
           const state: State = {
             id: randomUUIDv7(),

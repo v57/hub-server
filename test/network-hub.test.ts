@@ -12,7 +12,7 @@ describe('Hub Network on the hub', () => {
   const clients: Client[] = []
   const client = (key: TestKey, device?: TestKey) => {
     const c = connect(port, () => ({
-      auth: token(key, security.hubKey),
+      auth: token(key, security.hubKey, security.nonces),
       v: '1',
       ...(device ? { device: certificate(device, key, { deviceName: 'Agent Box' }) } : {}),
     }))

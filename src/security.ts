@@ -4,6 +4,7 @@ import { Storage, settings, type SecurityMode } from './settings'
 import { deviceId } from './devices'
 import { FreshState } from './fresh-state'
 import { GrantStore, parseObject, parseSubject, type Grant } from './grants'
+import { TokenNonces } from './nonces'
 
 interface SecurityInterface {
   requireOwner(user: Caller | Principal | string | undefined, path: string): void
@@ -255,6 +256,8 @@ class Members {
 
 export class Security implements SecurityInterface {
   keys = new Keys()
+  /** The challenges v1 tokens sign */
+  nonces = new TokenNonces()
   host = new Host()
   grants = new GrantStore()
   members = new Members()
@@ -267,7 +270,7 @@ export class Security implements SecurityInterface {
   /** This hub's own key, which v1 tokens are bound to */
   hubKey?: string
   mode: SecurityMode = 'default-allow'
-  requireV1 = false
+  requireV1 = true
   /** A store that grants failed to load: only owners may call service paths until an owner sets the mode */
   lockdown = false
   /** Local mode (protocol.md section 12): `default-allow`, and the launcher key is an owner without being stored */
@@ -488,14 +491,20 @@ export class Security implements SecurityInterface {
 
 // Longest auth token lifetime the hub accepts, in seconds
 export const authMaxLifetime = 5 * 60
+// A v1 token's nonce lasts this long, and so does the token
+export const authV1MaxLifetime = 60
 // Tolerated clock difference between signer and hub, in seconds
 export const authClockSkew = 30
 
 export interface TokenOptions {
-  /** The `v` header: missing or "0" signs the expiry, "1" signs `hub1:<hub key>:<expiry>` */
+  /** The `v` header: missing or "0" signs the expiry, "1" signs `hub1:<hub key>:<nonce>:<expiry>` */
   version?: string
+  /** A connection without `auth` may open on a hub with an enforced whitelist, to ask `hub/info` and nothing else */
+  anonymousAllowed?: boolean
   hubKey?: string
   requireV1?: boolean
+  /** The hub's own nonces: without them v1 tokens are refused */
+  nonces?: TokenNonces
 }
 
 class Keys {
@@ -503,27 +512,34 @@ class Keys {
     const version = options.version ?? '0'
     if (version !== '0' && version !== '1') throw 'unsupported version'
     if (!signedKey?.length) {
-      if (whitelist.enforced) throw 'hub is not available'
+      if (whitelist.enforced && !options.anonymousAllowed) throw 'hub is not available'
       else return
     }
     if (version === '0' && options.requireV1) throw 'unsupported version'
     const parts = signedKey.split('.')
-    if (parts.length !== 4 || parts[0] !== 'key') throw 'invalid key'
-    const [_, key, hash, time] = parts
-    if (whitelist.enforced && !whitelist.allows(key)) throw 'hub is not available'
-    if (version === '1' && !options.hubKey) throw 'unsupported version'
-    const signed = version === '1' ? `hub1:${options.hubKey}:${time}` : time
-    if (!this.verifyPub(key, hash, time, signed)) throw 'invalid signature'
+    if (parts.length !== (version === '1' ? 5 : 4) || parts[0] !== 'key') throw 'invalid key'
+    const [_, key, hash, time, nonce] = parts
+    if (whitelist.enforced && !whitelist.allows(key!)) throw 'hub is not available'
+    if (version === '1') {
+      if (!options.hubKey || !options.nonces) throw 'unsupported version'
+      // Before the signature: one HMAC turns away what isn't this hub's, or was used
+      if (!options.nonces.isValid(nonce!)) throw 'invalid nonce'
+    }
+    const signed = version === '1' ? `hub1:${options.hubKey}:${nonce}:${time}` : time
+    const lifetime = version === '1' ? authV1MaxLifetime : authMaxLifetime
+    if (!this.verifyPub(key!, hash!, time!, signed!, lifetime)) throw 'invalid signature'
+    // Only a valid signature takes up room in the store of used nonces
+    if (version === '1' && !options.nonces!.consume(nonce!)) throw 'invalid nonce'
     return key
   }
   // Can handle around 38k verifications per second
-  private verifyPub(key: string, signature: string, time: string, signed: string): boolean {
-    // Signers write the expiry as decimal Unix seconds (now + 10 by default, 60 in Swift)
+  private verifyPub(key: string, signature: string, time: string, signed: string, lifetime: number): boolean {
+    // Signers write the expiry as decimal Unix seconds
     if (!/^\d{1,12}$/.test(time)) throw 'invalid key'
     const expiry = Number(time)
     const now = Math.round(Date.now() / 1000)
     if (expiry + authClockSkew <= now) throw 'authorization expired'
-    if (expiry > now + authMaxLifetime + authClockSkew) throw 'authorization expires too late'
+    if (expiry > now + lifetime + authClockSkew) throw 'authorization expires too late'
     const pubKey = createPublicKey({ key: Buffer.from(key, 'base64'), format: 'der', type: 'spki' })
     const verified = verify(null, Buffer.from(signed), pubKey, Buffer.from(signature, 'base64'))
     return verified

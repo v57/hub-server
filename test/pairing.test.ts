@@ -226,7 +226,7 @@ describe('pairing on the hub', () => {
   const client = (key?: TestKey, device?: TestKey) => {
     const c = connect(port, () =>
       key
-        ? { auth: token(key, security.hubKey), v: '1', ...(device ? { device: certificate(device, key) } : {}) }
+        ? { auth: token(key, security.hubKey, security.nonces), v: '1', ...(device ? { device: certificate(device, key) } : {}) }
         : {},
     )
     clients.push(c)
