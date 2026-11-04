@@ -53,12 +53,24 @@ describe('Storage', () => {
 })
 
 describe('NetworkRegistry', () => {
+  test('the presence secret is made once, also for a registry from before it, and outlives a restart', async () => {
+    const { NetworkRegistry } = await import('../src/network/registry')
+    const path = join(directory(), 'network.json')
+    writeFileSync(path, JSON.stringify({ schemaVersion: 1, hubNetworkId: 'existing', hubKey: 'k' }))
+    const first = await new NetworkRegistry(path).load()
+    expect(first.getIdentity().hubNetworkId).toBe('existing')
+    expect(Buffer.from(first.getPresenceSecret(), 'base64')).toHaveLength(32)
+    await first.storage.write()
+    expect((await new NetworkRegistry(path).load()).getPresenceSecret()).toBe(first.getPresenceSecret())
+  })
+
   test('a corrupt registry gets no new identity and allocates nothing', async () => {
     const { NetworkRegistry } = await import('../src/network/registry')
     const path = join(directory(), 'network.json')
     writeFileSync(path, '{"schemaVersion": 1, "allocations": ')
     const registry = await new NetworkRegistry(path).load()
     expect(registry.getIdentity().hubNetworkId).toBe('')
+    expect(registry.getPresenceSecret()).toBe('')
     expect(() => registry.allocateAddresses('key')).toThrow('corrupt')
   })
 })

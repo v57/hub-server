@@ -639,6 +639,7 @@ export class NetworkAPI {
       }
     }
     const { hubKey, hubNetworkId } = this.registry.getIdentity()
+    const presenceSecret = this.registry.getPresenceSecret()
     return {
       version: HUB_NETWORK_WIRE_VERSION,
       hubKey,
@@ -646,6 +647,7 @@ export class NetworkAPI {
       coordinator: this.coordinator(),
       hubHost: host?.key === caller.key,
       grants,
+      ...(presenceSecret ? { presenceSecret } : {}),
     }
   }
 

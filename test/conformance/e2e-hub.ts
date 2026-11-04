@@ -533,6 +533,20 @@ try {
     assert((await failed(first(connect(() => auth(newKey(), hubKey)).values('hub/devices'), () => true))).includes('permissions required'), 'a plain key read the directory')
     waiting.c.stop()
   })
+  await check('network/links gives a member the presence secret, and nobody else', async () => {
+    // Before a profile: nothing, also for an owner
+    const unbound = await failed(first(ownerC.values('network/links'), () => true, 2500))
+    assert(unbound.length > 0, `no profile: ${unbound}`)
+    await ownerC.send('hub/net/bind', {
+      version: 1, bindingKind: 'apple-app', wireGuardKey: 'wg-conformance', overlayAddresses: [], connectedAt: new Date().toISOString(),
+    })
+    const links = await first<any>(ownerC.values('network/links'), () => true)
+    assert(Buffer.from(links.presenceSecret, 'base64').length === 32, `secret ${JSON.stringify(links.presenceSecret)}`)
+    const again = await first<any>(ownerC.values('network/links'), () => true)
+    assert(again.presenceSecret === links.presenceSecret, 'the secret changed')
+    const stranger = await failed(first(connect(() => auth(newKey(), hubKey)).values('network/links'), () => true, 2500))
+    assert(!stranger.includes(links.presenceSecret), 'a plain key got the secret')
+  })
   await check('network/agents/list hides other members from a member', async () => {
     const value = await first<any>(memberA.c.values('network/agents/list'), () => true)
     assert(Array.isArray(value) && value.length === 0, `agents ${JSON.stringify(value)}`)

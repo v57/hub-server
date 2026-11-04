@@ -1,4 +1,5 @@
 import { randomUUIDv7 } from 'bun'
+import { randomBytes } from 'node:crypto'
 import type { NetworkPolicy, NetworkResource, LiveProvider, AgentProfile, AgentStatus, ConnectionStatus, ResourceGenerationSnapshot, RevokedDevice } from './wire'
 import { Storage } from '../settings'
 import { ObjectMap } from 'channel/channel'
@@ -39,9 +40,12 @@ export class NetworkRegistry {
     // A corrupt registry stays empty and read-only: no identity, no new members
     if (this.storage.corrupt) return this
     assertUniqueAllocations(this.data.allocations)
-    const needsIdentity = !this.data.hubNetworkId
-    if (needsIdentity) {
+    const needsIdentity = !this.data.hubNetworkId || !this.data.presenceSecret
+    if (!this.data.hubNetworkId) {
       this.data.hubNetworkId = this.generateHubNetworkId()
+    }
+    if (!this.data.presenceSecret) {
+      this.data.presenceSecret = randomBytes(32).toString('base64')
     }
     if (needsIdentity || this.needsMigration) {
       this.data.schemaVersion = REGISTRY_SCHEMA_VERSION
@@ -231,6 +235,15 @@ export class NetworkRegistry {
     resource.generation++
     this.storage.save()
     return resource.generation
+  }
+
+  /**
+   * What this Hub shares with its members so the coordinator says nothing about them to anyone else: a device registers
+   * tags derived from it, and an opener shows a proof derived from it. The coordinator sees neither the secret nor a
+   * value good for another device. Empty only for a corrupt registry.
+   */
+  getPresenceSecret(): string {
+    return this.data.presenceSecret
   }
 
   /**
@@ -705,6 +718,7 @@ function defaultRegistryData(): RegistryData {
   return {
     schemaVersion: REGISTRY_SCHEMA_VERSION,
     hubNetworkId: '',
+    presenceSecret: '',
     hubKey: '',
     nextIPv4: parseAddress(OVERLAY_RANGES.ipv4.first).toString(),
     lastIPv4: parseAddress(OVERLAY_RANGES.ipv4.last).toString(),
@@ -751,6 +765,7 @@ function assertUniqueAllocations(allocations: Record<string, string[]>): void {
 export interface RegistryData {
   schemaVersion: number
   hubNetworkId: string
+  presenceSecret: string
   hubKey: string
   nextIPv4: string // BigInt as string for JSON serialization
   lastIPv4: string // BigInt as string for JSON serialization

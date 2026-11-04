@@ -90,6 +90,16 @@ describe('Peer links', () => {
     await expect(api.links(state(makeKey()))).rejects.toMatchObject({ code: 'unauthorized' })
   })
 
+  test('members get the presence secret, and nobody without a profile does', async () => {
+    const phone = owner()
+    const phoneState = state(phone)
+    await api.bindAgent(bind('wg-phone'), {} as never, phoneState)
+    const secret = (await api.links(phoneState)).presenceSecret!
+    expect(Buffer.from(secret, 'base64')).toHaveLength(32)
+    expect(secret).toBe(api.registry.getPresenceSecret())
+    await expect(api.links(state(makeKey()))).rejects.toMatchObject({ code: 'unauthorized' })
+  })
+
   test('the hub link opens the ports of the machine\'s shares the member may open', async () => {
     const { machine } = await hubMachine()
     const service = makeKey()

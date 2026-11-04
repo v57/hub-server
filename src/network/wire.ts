@@ -234,6 +234,8 @@ export interface PeerLinks extends Versioned {
   coordinator: string
   hubHost: boolean
   grants: PeerLinkGrant[]
+  /** What this Hub and its members share, so the coordinator gives no online or offline answer to anyone else. Base64 */
+  presenceSecret?: string
 }
 
 export type CandidateKind = 'host' | 'server-reflexive'
