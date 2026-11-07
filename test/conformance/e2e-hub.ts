@@ -176,7 +176,7 @@ try {
   const ownerC = connect(() => auth(owner, hubKey))
   await check('owner v1 connect + owner API', async () => {
     const mode = await first(ownerC.values('hub/security/mode'), (m: any) => !!m)
-    assert((mode as any).requireV1 === true, 'requireV1 is off on a new hub')
+    assert((mode as any).requireV1 === false, 'a new hub refuses v0 before an owner chose it (Hub 1.0 apps)')
     await ownerC.send('hub/security/mode/set', { requireV1: true })
   })
   await check('v1 token for another hub is refused', async () => {

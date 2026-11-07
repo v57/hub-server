@@ -39,6 +39,9 @@ describe('one-shot reads of hub streams', () => {
     expect((await first<any[]>(owners, 'hub/grants')).some(g => g.id === grant.id)).toBe(true)
     await owners.sender.send('hub/group/create', { name: 'Anna', person: true })
     expect((await first<any[]>(owners, 'hub/groups')).find(g => g.id === 'Anna')).toMatchObject({ person: true })
+    // v0 stays accepted until an owner refuses it, so the Hub 1.0 app keeps working
+    expect(await first(owners, 'hub/security/mode')).toMatchObject({ requireV1: false })
+    await owners.sender.send('hub/security/mode/set', { requireV1: true })
     expect(await first(owners, 'hub/security/mode')).toMatchObject({ requireV1: true })
     await owners.sender.send('hub/security/mode/set', { requireV1: false })
     expect(await first(owners, 'hub/security/mode')).toMatchObject({ requireV1: false })

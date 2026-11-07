@@ -82,8 +82,15 @@ describe('v1 tokens', () => {
     const key = makeKey()
     expect(await opens({ auth: token(key, security.hubKey, nonce, 300), v: '1' })).toBe(false)
   })
-  test('a v0 token, the old way in for a replay, is refused by default', async () => {
-    expect(await opens({ auth: token(makeKey()), v: '0' })).toBe(false)
+  test('a v0 token is accepted until an owner requires v1 (Hub 1.0 apps), then refused', async () => {
+    expect(security.requireV1).toBe(false)
+    expect(await opens({ auth: token(makeKey()), v: '0' })).toBe(true)
+    security.requireV1 = true
+    try {
+      expect(await opens({ auth: token(makeKey()), v: '0' })).toBe(false)
+    } finally {
+      security.requireV1 = false
+    }
   })
   test('a refused signature leaves no used nonce behind', async () => {
     const before = security.nonces.usedCount

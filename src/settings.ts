@@ -33,7 +33,12 @@ export type SecurityMode = 'default-allow' | 'default-deny'
 export interface SecuritySettings {
   mode: SecurityMode
   requireV1: boolean
-  /** An owner turned `requireV1` off. Stores from before auth v2 hold `requireV1: false` that nobody chose. */
+  /**
+   * An owner turned `requireV1` on. Until then v0 tokens are accepted, so the Hub 1.0 app (v0 only) keeps reaching
+   * Hubs that updated from `main`; a stored `requireV1` alone, written by every Hub since auth v2, means nothing.
+   */
+  refuseV0?: true
+  /** An owner turned `requireV1` off (kept for builds that read it) */
   allowV0?: true
 }
 interface ApiSettings {
@@ -46,7 +51,7 @@ export class HubSettings {
     proxies: [],
     api: {},
     pendingLimit: 0,
-    security: { mode: 'default-deny', requireV1: true },
+    security: { mode: 'default-deny', requireV1: false },
     mergeKeys: {},
   }
   storage: Storage
@@ -67,8 +72,8 @@ export class HubSettings {
         this.storedMode = data.security?.mode !== undefined
         this.data.security = {
           mode: data.security?.mode === 'default-deny' ? 'default-deny' : 'default-allow',
-          requireV1: data.security?.allowV0 !== true,
-          ...(data.security?.allowV0 === true ? { allowV0: true as const } : {}),
+          requireV1: data.security?.refuseV0 === true,
+          ...(data.security?.refuseV0 === true ? { refuseV0: true as const } : { allowV0: true as const }),
         }
       },
     )
@@ -102,8 +107,13 @@ export class HubSettings {
     if (typeof security.requireV1 === 'boolean') {
       changed ||= this.data.security.requireV1 !== security.requireV1
       this.data.security.requireV1 = security.requireV1
-      if (security.requireV1) delete this.data.security.allowV0
-      else this.data.security.allowV0 = true
+      if (security.requireV1) {
+        this.data.security.refuseV0 = true
+        delete this.data.security.allowV0
+      } else {
+        delete this.data.security.refuseV0
+        this.data.security.allowV0 = true
+      }
     }
     if (changed) this.storage.save()
   }

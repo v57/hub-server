@@ -83,29 +83,31 @@ describe('security mode migration', () => {
     expect(settings.data.pendingLimit).toBe(3)
     expect((await Bun.file(path).json()).security.mode).toBe('default-allow')
   })
-  test('a stored mode is kept', async () => {
+  test('a stored mode is kept, and an owner\'s refuseV0', async () => {
     const path = join(dir(), 'hub.json')
-    writeFileSync(path, JSON.stringify({ security: { mode: 'default-deny', requireV1: true } }))
+    writeFileSync(path, JSON.stringify({ security: { mode: 'default-deny', requireV1: true, refuseV0: true } }))
     const settings = await new HubSettings(path).load()
-    expect(settings.data.security).toEqual({ mode: 'default-deny', requireV1: true })
+    expect(settings.data.security).toEqual({ mode: 'default-deny', requireV1: true, refuseV0: true })
   })
-  test('requireV1: false from before auth v2 counts as unset', async () => {
-    const path = join(dir(), 'hub.json')
-    writeFileSync(path, JSON.stringify({ security: { mode: 'default-allow', requireV1: false } }))
-    const settings = await new HubSettings(path).load()
-    expect(settings.data.security.requireV1).toBe(true)
+  test('a stored requireV1 alone, before or since auth v2, keeps v0 accepted (Hub 1.0 apps)', async () => {
+    for (const requireV1 of [false, true]) {
+      const path = join(dir(), 'hub.json')
+      writeFileSync(path, JSON.stringify({ security: { mode: 'default-allow', requireV1 } }))
+      const settings = await new HubSettings(path).load()
+      expect(settings.data.security.requireV1).toBe(false)
+    }
   })
-  test('an owner turning requireV1 off is kept, and on again', async () => {
+  test('an owner turning requireV1 on is kept, and off again', async () => {
     const path = join(dir(), 'hub.json')
     const settings = await new HubSettings(path).load()
-    expect(settings.data.security.requireV1).toBe(true)
-    settings.setSecurity({ requireV1: false })
+    expect(settings.data.security.requireV1).toBe(false)
+    settings.setSecurity({ requireV1: true })
     await settings.storage.write()
     const again = await new HubSettings(path).load()
-    expect(again.data.security.requireV1).toBe(false)
-    again.setSecurity({ requireV1: true })
+    expect(again.data.security.requireV1).toBe(true)
+    again.setSecurity({ requireV1: false })
     await again.storage.write()
-    expect((await new HubSettings(path).load()).data.security.requireV1).toBe(true)
+    expect((await new HubSettings(path).load()).data.security.requireV1).toBe(false)
   })
   test('a corrupt hub.json is default-deny', async () => {
     const path = join(dir(), 'hub.json')

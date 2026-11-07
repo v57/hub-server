@@ -273,7 +273,7 @@ export class Security implements SecurityInterface {
   /** This hub's own key, which v1 tokens are bound to */
   hubKey?: string
   mode: SecurityMode = 'default-allow'
-  requireV1 = true
+  requireV1 = false
   /** A store that grants failed to load: only owners may call service paths until an owner sets the mode */
   lockdown = false
   /** Local mode (protocol.md section 12): `default-allow`. Nobody is an owner by it. */
