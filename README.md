@@ -21,6 +21,18 @@ bunx v57/hub-server
 bun i && bun .
 ```
 
+## For developers
+
+Developer documentation is in [docs/](docs/README.md).
+
+| What | Purpose | Runtime | Install or run |
+|---|---|---|---|
+| [`hub-server`](docs/running.md) (`index.ts`, the package's `bin`) | The Hub server: routing, owners and grants, devices, pairing, the Hub Network control plane | Bun; macOS and Linux | `bunx v57/hub-server`, or `bun i && bun .` in a clone |
+| [Conformance harness](docs/testing.md#conformance-harness) (`test/conformance/e2e-hub.ts`) | Checks any Hub server over the raw protocol; the Swift [HubServer](https://github.com/v57/HubServer) passes it too | Bun | `bun run conformance` |
+
+Pages: [Running](docs/running.md), [Data folder](docs/data.md), [Security](docs/security.md), [APIs](docs/api.md),
+[Hub Network](docs/network.md), [Testing](docs/testing.md).
+
 ## Options
 - `-h`, `--help`: print the options and exit
 - `-p`, `--port <port>`: listen on a specific port or address
