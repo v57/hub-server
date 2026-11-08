@@ -94,6 +94,7 @@ export class ServiceUpdateContext {
   applyChanges() {
     if (!this.hasChanges) return
     this.hub.apiList.setNeedsUpdate()
+    this.hub.apiDescriptions.setNeedsUpdate()
     if (!this.isActive) return
     this.merger.connections.forEach(a => a.update(this.added, this.removed))
   }

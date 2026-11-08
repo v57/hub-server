@@ -260,6 +260,47 @@ try {
     assert(caller?.key === stranger.pub && caller.owner === false, `caller ${JSON.stringify(caller)}`)
   })
 
+  // 3b. API descriptions (protocol.md section 15)
+  await check('hub/api/list describes paths per kind for the callers who may call them', async () => {
+    const docKey = newKey()
+    await ownerC.send('hub/host/update', { key: docKey.pub, allow: ['e2e/doc'] })
+    const docChannel = new Channel<any>()
+    docChannel.post('e2e/doc', () => 'post').stream('e2e/doc', async function* () { yield 'value' })
+    const input = { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] }
+    const doc = docChannel.connect(address, {
+      headers: () => auth(docKey, hubKey),
+      async onConnect(s) {
+        await s.send('hub/service/update', { services: [
+          { path: 'e2e/doc', kind: 'post', title: 'Doc', description: 'Reads one doc.', inputSchema: input, annotations: { readOnlyHint: true, bogus: 1 } },
+          { path: 'e2e/doc', kind: 'stream', description: 'x'.repeat(5000), outputSchema: { type: 'string' } },
+        ] })
+      },
+    }) as any
+    try {
+      const listed: any[] = await first(ownerC.values('hub/api/list'), (l: any) => Array.isArray(l) && l.some(e => e.path === 'e2e/doc'))
+      const entries = listed.filter(e => e.path === 'e2e/doc')
+      const expected = [
+        { path: 'e2e/doc', kind: 'post', title: 'Doc', description: 'Reads one doc.', inputSchema: input, annotations: { readOnlyHint: true } },
+        { path: 'e2e/doc', kind: 'stream', outputSchema: { type: 'string' } },
+      ]
+      assert(JSON.stringify(entries) === JSON.stringify(expected), `entries ${JSON.stringify(entries)}`)
+      const posted: any[] = await ownerC.send('hub/api/list')
+      assert(JSON.stringify(posted.filter(e => e.path === 'e2e/doc')) === JSON.stringify(expected), 'post and stream answers differ')
+      const paths = posted.map(e => e.path)
+      assert(JSON.stringify(paths) === JSON.stringify([...paths].sort()), 'not sorted by path')
+      assert(paths.includes('e2e/whoami') && posted.find(e => e.path === 'e2e/whoami')?.kind === undefined, 'a path without kind should be bare')
+      const own = posted.filter(e => e.path === 'hub/api/list').map(e => e.kind).join(',')
+      assert(own === 'post,stream', `hub/api/list kinds ${own}`)
+      const anonymous = connect(() => ({}))
+      const seen: any[] = await anonymous.send('hub/api/list')
+      anonymous.ws?.close?.()
+      assert(!seen.some(e => e.path === 'e2e/doc' || e.path === 'hub/connections'), 'anonymous caller sees paths it may not call')
+      assert(seen.some(e => e.path === 'hub/info'), 'anonymous caller misses hub/info')
+    } finally {
+      doc.ws?.close?.()
+    }
+  })
+
   // 4a. groups: person group, several groups per member, group grant
   await check('person group + several groups + group grant', async () => {
     const g1: any = await ownerC.send('hub/group/create', { name: 'Alex', person: true })

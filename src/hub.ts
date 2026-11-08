@@ -22,6 +22,7 @@ import { HubDevices } from './hub-devices'
 import { FreshState } from './fresh-state'
 import { Pairing } from './pairing'
 import type { Certificate } from './devices'
+import { describePath, readDescriptions, type ApiDescription, type ApiKind, type PathDescriptions } from './api-descriptions'
 
 export type { Sender } from 'channel/client'
 
@@ -66,6 +67,8 @@ export interface State {
   draining?: boolean
   /** It authenticated with a v1 token */
   v1?: boolean
+  /** What its last `services` update said about its paths (protocol.md section 15) */
+  apiDescriptions?: Map<string, PathDescriptions>
 }
 
 interface ServiceProvider {
@@ -103,6 +106,10 @@ export class Hub {
   server?: Server
   ready: Promise<void>
   apiList = new LazyStates<State, string[]>(state => this.allowedApi(security.caller(state)))
+  /** `hub/api/list` streams */
+  apiDescriptions = new LazyStates<State, ApiDescription[]>(state => this.describedApi(security.caller(state)))
+  /** Kinds of the hub's own paths, for `hub/api/list` */
+  builtinKinds = new Map<string, ApiKind[]>()
   /** Keyed by JSON `[key, device, path]` */
   serviceProviders = new LazyStates<string, ServiceProvider[]>((id: string) => {
     const [key, device, path] = JSON.parse(id)
@@ -143,6 +150,7 @@ export class Hub {
       this.serviceProviders.setNeedsUpdate()
       hubNetList.setNeedsUpdate()
       this.apiList.setNeedsUpdate()
+      this.apiDescriptions.setNeedsUpdate()
     }
     const appleAgentEnabled = appleAgentAPIsEnabled()
     security.registerProtectedApis({
@@ -252,6 +260,8 @@ export class Hub {
         sendUpdates()
       })
       .post('hub/api', ({ state, sender, context }) => this.allowedApi(this.caller(state, sender, context)))
+      .post('hub/api/list', ({ state, sender, context }) => this.describedApi(this.caller(state, sender, context)))
+      .stream('hub/api/list', ({ state }) => this.apiDescriptions.makeIterator(state))
       .stream('hub/net/list', () => hubNetList.makeIterator())
       .stream('hub/net/node', () => hubNetNode.makeIterator())
       .post('hub/net/node/set', async ({ body, state, path }) => {
@@ -276,6 +286,7 @@ export class Hub {
         const context = this.merger.context()
         if (services && Array.isArray(services)) {
           const s = services as ServiceHeader[]
+          state.apiDescriptions = readDescriptions(s)
           const paths = new Set(s.map(a => a.path))
           const add = paths.difference(state.services)
           const remove = state.services.difference(paths)
@@ -596,6 +607,8 @@ export class Hub {
       })))
 
     this.api = new Set([...Object.keys(this.channel.postApi.storage), ...Object.keys(this.channel.streamApi.storage)])
+    for (const path of Object.keys(this.channel.postApi.storage)) this.builtinKinds.set(path, ['post'])
+    for (const path of Object.keys(this.channel.streamApi.storage)) this.builtinKinds.set(path, [...(this.builtinKinds.get(path) ?? []), 'stream'])
     settings.data.merge.forEach(address => this.merger.connect(address, this))
   }
   stats() {
@@ -627,6 +640,19 @@ export class Hub {
   /** Paths the caller may call, for `hub/api` */
   allowedApi(caller: Caller): string[] {
     return security.allowedApi(caller, this.api, path => this.services.get(path)?.isPublic ?? false)
+  }
+  /**
+   * `hub/api/list`: the caller's paths with what their providers say about them (protocol.md section 15). Only
+   * providers calls are routed to count, draining ones included, so a key waiting for approval describes nothing.
+   */
+  describedApi(caller: Caller): ApiDescription[] {
+    return this.allowedApi(caller)
+      .sort()
+      .flatMap(path => {
+        const service = this.services.get(path)
+        const providers = service ? [...service.services, ...service.draining].map(provider => provider.state.apiDescriptions?.get(path)) : []
+        return describePath(path, this.builtinKinds.get(path), providers)
+      })
   }
   /**
    * Who sent a request. A request from a hub this one merges into is that hub's caller: its key as `hub/info`
@@ -1146,6 +1172,8 @@ interface ServiceHeader {
   limit?: number
   /** Callable by anyone in `default-deny` */
   public?: boolean
+  /** Which handler the description fields are about (protocol.md section 15), see `readDescriptions` */
+  kind?: 'post' | 'stream'
 }
 interface ServicePermissions {
   group?: string

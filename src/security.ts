@@ -105,6 +105,7 @@ const publicBuiltins = new Set([
   'hub/info',
   'hub/service/update',
   'hub/api',
+  'hub/api/list',
   'hub/status',
   'hub/status/badges',
   'hub/proxy/join',
