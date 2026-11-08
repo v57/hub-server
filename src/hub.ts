@@ -367,6 +367,8 @@ export class Hub {
           return true
         })
         this.services.get(path)?.setBalancer(type)
+        // hub/status names each path's balancer: without this, apps showed the old one until the next request
+        statusState.setNeedsUpdate()
       })
       .post('hub/balancer/limit', ({ body: { limit }, state, path }) => {
         security.requireOwner(state, path)
