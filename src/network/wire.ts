@@ -415,6 +415,8 @@ export type NetworkErrorCode =
   | 'internal'
   | 'device_endpoint_exists'
   | 'share_device_mismatch'
+  /** A member invited this device, and an owner hasn't approved it yet */
+  | 'approval_required'
 
 export interface NetworkError extends Versioned {
   code: NetworkErrorCode

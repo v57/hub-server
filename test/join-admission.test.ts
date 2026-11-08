@@ -50,8 +50,10 @@ describe('hub/net/bind join', () => {
     connectedAt: new Date(issuedAt).toISOString(),
     admission,
   })
-  const withInviter = () => {
-    const api = new NetworkAPI(new Security())
+  const withInviter = (owner = true) => {
+    const security = new Security()
+    if (owner) security.members.add('owners', `key:${admission.inviterServiceKey}`)
+    const api = new NetworkAPI(security)
     api.agents.registerProfile({
       version: 1,
       key: admission.inviterServiceKey,
@@ -129,5 +131,40 @@ describe('hub/net/bind join', () => {
     const member = api.listMembers().find(profile => profile.key === joinerKey)
     expect(member).toMatchObject({ online: false, wireGuardKey: joinerWireGuardKey })
     expect(member?.overlayAddresses).toHaveLength(2)
+  })
+
+  // Security audit M3: any member's admission approved the joining device
+  describe('invited by a member who is not an owner', () => {
+    const device = (approved: boolean) =>
+      ({ key: joinerKey, id: 'joiner', certificate: { deviceId: 'joiner-device' }, ...(approved ? { device: 'joiner-device' } : {}) }) as unknown as State
+    const bind = async (api: NetworkAPI, joiner: State) => {
+      const realNow = Date.now
+      Date.now = () => issuedAt + 1000
+      try {
+        return await api.bindAgent(request(admission), {} as never, joiner)
+      } finally {
+        Date.now = realNow
+      }
+    }
+
+    test('leaves the device pending for an owner', async () => {
+      const api = withInviter(false)
+      let approved = 0
+      api.onBindApprove = () => (approved += 1)
+      await expect(bind(api, device(false))).rejects.toMatchObject({ code: 'approval_required' })
+      expect(approved).toBe(0)
+      expect(api.listMembers().some(member => member.key === joinerKey)).toBe(false)
+    })
+
+    test('admits the device once an owner approved it', async () => {
+      const api = withInviter(false)
+      const joined = await bind(api, device(true))
+      expect(joined.profile.device).toBe('joiner-device')
+    })
+
+    test('refuses a key without a device to approve', async () => {
+      const api = withInviter(false)
+      await expect(bind(api, state(joinerKey, 'joiner'))).rejects.toMatchObject({ code: 'forbidden' })
+    })
   })
 })

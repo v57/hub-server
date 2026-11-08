@@ -365,6 +365,16 @@ export class NetworkAPI {
     if (!this.isMember(state) && !admitted) {
       throw networkError('forbidden', 'a valid invitation admission is required to join', false)
     }
+    // Members may invite, but only an owner admits (security decisions 1.0, Hub 4): a device a member invited joins
+    // once an owner approved it, by its name and code, like any other device asking to join.
+    if (!this.isMember(state) && !this.security.isOwner({ key: inviter!.key, device: inviter!.device })) {
+      if (!state.certificate?.deviceId) {
+        throw networkError('forbidden', "a member's invitation admits only a device an owner approves", false)
+      }
+      if (!state.device) {
+        throw networkError('approval_required', 'an owner must approve this device before it joins', true)
+      }
+    }
     return this.registerAuthenticatedProfile(profile, state)
   }
 
