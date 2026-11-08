@@ -268,6 +268,8 @@ export class Security implements SecurityInterface {
   group = new Group(this.grants, this.members)
   launcher?: string
   whitelist = new Whitelist(user => this.isOwner(user))
+  /** Keys that authenticated with v1 here: v0 tokens are refused from them for good */
+  v1Keys = new V1Keys()
   /** Device names for `caller.device`, set by the hub */
   deviceName?: (id: string) => string | undefined
   /** This hub's own key, which v1 tokens are bound to */
@@ -291,6 +293,7 @@ export class Security implements SecurityInterface {
       this.whitelist.storage.load(),
       this.members.storage.load(),
       this.grants.storage.load(),
+      this.v1Keys.storage.load(),
     ])
     this.migrate()
     this.mode = settings.data.security.mode
@@ -367,6 +370,28 @@ export class Security implements SecurityInterface {
     const launcher = this.launcher && !isRevoked(this.launcher) ? this.launcher : undefined
     this.grants.removeWhere(({ subject, by }) => by === launcherGrant && !('key' in subject && subject.key === launcher))
     if (launcher) this.grants.add({ key: launcher }, { prefix: 'launcher/' }, launcherGrant)
+  }
+  /** Whether v0 tokens are refused from every key: an owner refused them, or the transition ended */
+  refusesV0(now = Date.now()): boolean {
+    return this.requireV1 || settings.refusesV0(now)
+  }
+  /**
+   * A connection authenticated with v1. Its key is refused v0 from now on when the hub knows it: a member of a group,
+   * an approved device, or a key that holds grants, hosting approvals, a whitelist entry or the launcher's paths.
+   * Keys the hub doesn't know hold nothing a replayed token could reach, and recording them would let anyone fill the
+   * store.
+   */
+  usedV1(principal: Principal) {
+    const key = principal.key
+    if (!key || this.v1Keys.has(key)) return
+    const known =
+      !!principal.device ||
+      this.groups(principal).length > 0 ||
+      this.grants.grants.some(({ subject }) => 'key' in subject && subject.key === key) ||
+      this.host.allowed(key).size > 0 ||
+      this.whitelist.lists(key) ||
+      this.launcher === key
+    if (known) this.v1Keys.add(key)
   }
   /** `default-deny` while locked down */
   get effectiveMode(): SecurityMode {
@@ -510,9 +535,7 @@ export class Security implements SecurityInterface {
   }
 }
 
-// Longest auth token lifetime the hub accepts, in seconds
-export const authMaxLifetime = 5 * 60
-// A v1 token's nonce lasts this long, and so does the token
+// A v1 token's nonce lasts this long, and so does the token (v0 tokens too, since the v0 transition)
 export const authV1MaxLifetime = 60
 // Tolerated clock difference between signer and hub, in seconds
 export const authClockSkew = 30
@@ -526,6 +549,8 @@ export interface TokenOptions {
   requireV1?: boolean
   /** The hub's own nonces: without them v1 tokens are refused */
   nonces?: TokenNonces
+  /** Keys refused v0 for good, because they used v1 */
+  v1Keys?: V1Keys
 }
 
 class Keys {
@@ -547,8 +572,10 @@ class Keys {
       if (!options.nonces.isValid(nonce!)) throw 'invalid nonce'
     }
     const signed = version === '1' ? `hub1:${options.hubKey}:${nonce}:${time}` : time
-    const lifetime = version === '1' ? authV1MaxLifetime : authMaxLifetime
-    if (!this.verifyPub(key!, hash!, time!, signed!, lifetime)) throw 'invalid signature'
+    // v0 tokens live as long as v1 ones: a minute, as the Hub 1.0 app signs them
+    if (!this.verifyPub(key!, hash!, time!, signed!, authV1MaxLifetime)) throw 'invalid signature'
+    // After the signature, so it tells nobody else which keys use v1
+    if (version === '0' && options.v1Keys?.has(key!)) throw 'unsupported version'
     // Only a valid signature takes up room in the store of used nonces
     if (version === '1' && !options.nonces!.consume(nonce!)) throw 'invalid nonce'
     return key
@@ -894,6 +921,32 @@ class GroupNames {
   }
 }
 
+/**
+ * `data/v1-keys.json`: the keys that authenticated with v1 and that the hub knows, as the first 32 hex characters of
+ * the SHA-256 of their SPKI (a device id for a device key). A key on the list is refused v0 for good. While the file
+ * is corrupt every key is.
+ */
+export class V1Keys {
+  ids = new Set<string>()
+  storage = new Storage(
+    'data/v1-keys.json',
+    () => ({ schema: 1, keys: Array.from(this.ids) }),
+    data => {
+      if (!data || typeof data !== 'object' || data.schema !== 1 || !Array.isArray(data.keys)) throw new Error('unsupported v1 keys file')
+      this.ids = new Set(data.keys.filter((id: unknown) => typeof id === 'string'))
+    },
+  )
+  has(key: string): boolean {
+    return this.storage.corrupt || this.ids.has(deviceId(key))
+  }
+  add(key: string) {
+    const id = deviceId(key)
+    if (this.ids.has(id)) return
+    this.ids.add(id)
+    this.storage.save()
+  }
+}
+
 class Whitelist {
   constructor(private exempt: (user: string) => boolean = () => false) {}
   enabled: boolean = false
@@ -928,6 +981,10 @@ class Whitelist {
   /** Enabled, or its file is corrupt and only exempt users (owners) get in */
   get enforced(): boolean {
     return this.enabled || this.storage.corrupt
+  }
+  /** On the list, whether or not it is enforced */
+  lists(user: string): boolean {
+    return this.users.has(user)
   }
   allows(user: string): boolean {
     if (this.exempt(user)) return true

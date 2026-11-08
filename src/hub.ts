@@ -64,6 +64,8 @@ export interface State {
   attachAsk?: { parent?: string }
   /** Its paths take no new calls (`hub/service/update { draining: true }`); running calls go on */
   draining?: boolean
+  /** It authenticated with a v1 token */
+  v1?: boolean
 }
 
 interface ServiceProvider {
@@ -131,7 +133,10 @@ export class Hub {
       }] : [])
     }).delay(1)
     const hubNetNode = new FreshState(() => this.hubNetNode.value)
-    const securityMode = new FreshState(() => ({ mode: security.effectiveMode, requireV1: security.requireV1 }))
+    const securityMode = new FreshState(() => {
+      const v0Until = settings.data.security.v0Until
+      return { mode: security.effectiveMode, requireV1: security.refusesV0(), ...(typeof v0Until === 'string' ? { v0Until } : {}) }
+    })
     const sendUpdates = () => {
       statusState.setNeedsUpdate()
       statusBadges.setNeedsUpdate()
@@ -559,8 +564,9 @@ export class Hub {
           const key = security.keys.verify(headers['auth'] ?? undefined, security.whitelist, {
             version: headers['v'],
             hubKey: security.hubKey,
-            requireV1: security.requireV1,
+            requireV1: security.refusesV0(),
             nonces: security.nonces,
+            v1Keys: security.v1Keys,
             anonymousAllowed: true,
           })
           const state: State = {
@@ -571,6 +577,10 @@ export class Hub {
             ip: headers['x-hub-remote-ip'],
           }
           hub.devices.connect(state, headers)
+          if (key && headers['v'] === '1') {
+            state.v1 = true
+            security.usedV1(state)
+          }
           return state
         },
         onConnect: (connection: BodyContext<State>) => {
@@ -604,6 +614,7 @@ export class Hub {
       this.devices.approveConnection(state)
       security.members.add(ownersGroup, deviceMember(id))
     }
+    if (state.v1) security.usedV1(state)
     this.connectionsChanged()
     console.log('Paired owner', state.key, id ? `on device ${id}` : '')
   }

@@ -45,6 +45,8 @@ async function ask(to: string, nonce = randomBytes(32).toString('base64url')) {
 }
 const proofHolds = (key: string, nonce: string, proof: string) =>
   verify(null, Buffer.from(`hubinfo1:${key}:${nonce}`), createPublicKey({ key: Buffer.from(key, 'base64'), format: 'der', type: 'spki' }), Buffer.from(proof, 'base64'))
+/** The Hub 1.0 App Store app's token: v0 over the expiry, a minute ahead, sent without `v` */
+const v0Token = (k: Key, exp = now() + 60) => ({ auth: `key.${k.pub}.${sig(k, `${exp}`)}.${exp}` })
 const v1Token = (k: Key, hubKey: string, nonce: string, exp = now() + 30) => ({ v: '1', auth: `key.${k.pub}.${sig(k, `hub1:${hubKey}:${nonce}:${exp}`)}.${exp}.${nonce}` })
 /** v1 headers over a fresh challenge from the server at `to` */
 async function auth(k: Key, hubKey: string, to = address) {
@@ -127,6 +129,7 @@ const dir = hub.dir
 let pairingHub: Awaited<ReturnType<typeof startHub>> | undefined
 let childHub: Awaited<ReturnType<typeof startHub>> | undefined
 let localHub: Awaited<ReturnType<typeof startHub>> | undefined
+const storeHubs: Awaited<ReturnType<typeof startHub>>[] = []
 
 let hubKey = ''
 const connect = (headers: () => any, onConnect?: (s: any) => Promise<void>, to = address) =>
@@ -151,9 +154,13 @@ try {
     try { await anon.send('hub/info', { nonce: 'short' }) } catch { failed = true }
     assert(failed, 'invalid client nonce accepted')
   })
-  await check('v0 and nonce-less v1 tokens are refused by default', async () => {
+  await check('a new hub takes the Hub 1.0 app\'s v0 token, for at most a minute', async () => {
+    assert(await opens(v0Token(newKey())), 'v0 refused on a new hub')
+    assert(await opens({ v: '0', ...v0Token(newKey()) }), 'v0 with v: "0" refused on a new hub')
+    assert(!(await opens(v0Token(newKey(), now() + 300))), 'a five-minute v0 token accepted')
+  })
+  await check('nonce-less v1 tokens are refused', async () => {
     const exp = now() + 60
-    assert(!(await opens({ v: '0', auth: `key.${owner.pub}.${sig(owner, `${exp}`)}.${exp}` })), 'v0 accepted')
     assert(!(await opens({ v: '1', auth: `key.${owner.pub}.${sig(owner, `hub1:${hubKey}:${exp}`)}.${exp}` })), 'v1 without nonce accepted')
   })
   await check('a v1 token works once', async () => {
@@ -177,7 +184,20 @@ try {
   await check('owner v1 connect + owner API', async () => {
     const mode = await first(ownerC.values('hub/security/mode'), (m: any) => !!m)
     assert((mode as any).requireV1 === false, 'a new hub refuses v0 before an owner chose it (Hub 1.0 apps)')
+  })
+  await check('a key the hub knows is refused v0 for good once it used v1', async () => {
+    assert(!(await opens(v0Token(owner))), 'the owner\'s v0 accepted after its v1 connect')
+    assert(!(await opens({ v: '0', ...v0Token(owner) })), 'the owner\'s v0 with v: "0" accepted after its v1 connect')
+    // A key the hub doesn't know holds nothing, and isn't kept
+    const passer = newKey()
+    assert(await opens(await auth(passer, hubKey)), 'v1 refused')
+    assert(await opens(v0Token(passer)), 'an unknown key\'s v0 refused after v1')
+  })
+  await check('an owner refusing v0 refuses it from every key', async () => {
     await ownerC.send('hub/security/mode/set', { requireV1: true })
+    const mode = await first(ownerC.values('hub/security/mode'), (m: any) => m?.requireV1 === true)
+    assert((mode as any).requireV1 === true, 'mode')
+    assert(!(await opens(v0Token(newKey()))), 'v0 accepted after the owner refused it')
   })
   await check('v1 token for another hub is refused', async () => {
     const other = newKey().pub
@@ -924,11 +944,39 @@ try {
     const paired: any = await connect(() => auth(pairer, info.key, localAddress), undefined, localAddress).send('hub/pair', { code })
     assert(paired?.owner === true, `paired ${JSON.stringify(paired)}`)
   })
+  // The v0 transition on stores written before (protocol.md section 2)
+  const storeHub = async (offset: number, security: object, v1Keys?: Key[]) => {
+    const storePort = port + offset
+    const started = await startHub(storePort, ['--owner', owner.pub], dir => {
+      mkdirSync(join(dir, 'data'), { recursive: true })
+      writeFileSync(join(dir, 'data', 'hub.json'), JSON.stringify({ security }))
+      if (v1Keys) writeFileSync(join(dir, 'data', 'v1-keys.json'), JSON.stringify({ schema: 1, keys: v1Keys.map(deviceId) }))
+    })
+    storeHubs.push(started)
+    return `ws://127.0.0.1:${storePort}`
+  }
+  await check('stores from before auth v2 and since take v0, except from a key on v1-keys.json', async () => {
+    const used = newKey()
+    const before = await storeHub(4, { mode: 'default-allow', requireV1: false }, [used])
+    assert(await opens(v0Token(newKey()), before), 'v0 refused on a store from before auth v2')
+    assert(!(await opens(v0Token(used), before)), 'v0 accepted from a key on v1-keys.json')
+    const since = await storeHub(6, { mode: 'default-deny', requireV1: true })
+    assert(await opens(v0Token(newKey()), since), 'v0 refused on a store from auth v2 (requireV1 alone)')
+  })
+  await check('a store whose owner refused v0, or whose transition ended, refuses it', async () => {
+    const refused = await storeHub(8, { mode: 'default-deny', requireV1: true, refuseV0: true })
+    assert(!(await opens(v0Token(newKey()), refused)), 'v0 accepted with refuseV0')
+    const ended = await storeHub(10, { mode: 'default-deny', requireV1: false, v0Until: new Date(Date.now() - 1000).toISOString() })
+    assert(!(await opens(v0Token(newKey()), ended)), 'v0 accepted after v0Until')
+    const ending = await storeHub(12, { mode: 'default-deny', requireV1: false, v0Until: new Date(Date.now() + 3_600_000).toISOString() })
+    assert(await opens(v0Token(newKey()), ending), 'v0 refused before v0Until')
+  })
 } finally {
   hub.proc.kill()
   pairingHub?.proc.kill()
   childHub?.proc.kill()
   localHub?.proc.kill()
+  storeHubs.forEach(started => started.proc.kill())
   const failed = results.filter(r => !r[1])
   for (const [n, ok, err] of results) console.log(`${ok ? 'PASS' : 'FAIL'} ${n}${err ? ` — ${err}` : ''}`)
   console.log(`\n${results.length - failed.length}/${results.length} passed (hub data in ${dir})`)

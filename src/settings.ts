@@ -20,6 +20,13 @@ export async function securePrivate(path: string, mode: number, directory = fals
   }
 }
 
+/**
+ * When the Hub stops taking v0 tokens (ISO 8601), written into every store that has no end yet. Unset for now: the
+ * release sets it to 90 days after the new Hub app is live. Until then the Hub 1.0 App Store app (v0 only) connects,
+ * except with a key that has used v1 here or on a Hub whose owner refused v0.
+ */
+export const v0TransitionEnd: string | undefined = undefined
+
 interface Settings {
   merge: string[]
   proxies: string[]
@@ -40,6 +47,18 @@ export interface SecuritySettings {
   refuseV0?: true
   /** An owner turned `requireV1` off (kept for builds that read it) */
   allowV0?: true
+  /**
+   * The end of the v0 transition (ISO 8601): from then on v0 tokens are refused. `null`: an owner took v0 back after
+   * it ended, so it has none. Missing: `v0TransitionEnd` is written here once it is set.
+   */
+  v0Until?: string | null
+}
+
+/** Whether `value` is a stored transition end: an ISO 8601 date and time with a zone, or null */
+function isV0Until(value: unknown): value is string | null {
+  if (value === null) return true
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/.test(value)) return false
+  return !Number.isNaN(Date.parse(value))
 }
 interface ApiSettings {
   loadBalancer?: LoadBalancer
@@ -74,6 +93,7 @@ export class HubSettings {
           mode: data.security?.mode === 'default-deny' ? 'default-deny' : 'default-allow',
           requireV1: data.security?.refuseV0 === true,
           ...(data.security?.refuseV0 === true ? { refuseV0: true as const } : { allowV0: true as const }),
+          ...(isV0Until(data.security?.v0Until) ? { v0Until: data.security.v0Until } : {}),
         }
       },
     )
@@ -93,10 +113,22 @@ export class HubSettings {
     } else if (!existed) {
       this.data.security.mode = ranBefore ? 'default-allow' : 'default-deny'
     }
-    if (!existed || this.storage.corrupt || !this.storedMode) {
+    const settingEnd = this.data.security.v0Until === undefined && v0TransitionEnd !== undefined
+    if (settingEnd) this.data.security.v0Until = v0TransitionEnd
+    if (!existed || this.storage.corrupt || !this.storedMode || settingEnd) {
       await this.storage.write().catch(error => console.error(`Failed to write ${path}:`, error))
     }
     return this
+  }
+  /** The transition end in milliseconds, undefined while there is none */
+  get v0Until(): number | undefined {
+    const until = this.data.security.v0Until
+    return typeof until === 'string' ? Date.parse(until) : undefined
+  }
+  /** Whether v0 tokens are refused from everyone: an owner refused them, or the transition ended */
+  refusesV0(now = Date.now()): boolean {
+    const until = this.v0Until
+    return this.data.security.requireV1 || (until !== undefined && now >= until)
   }
   setSecurity(security: Partial<SecuritySettings>) {
     let changed = false
@@ -113,6 +145,12 @@ export class HubSettings {
       } else {
         delete this.data.security.refuseV0
         this.data.security.allowV0 = true
+        // Taking v0 back after the transition ended keeps it, until an owner refuses it again
+        const until = this.v0Until
+        if (until !== undefined && Date.now() >= until) {
+          this.data.security.v0Until = null
+          changed = true
+        }
       }
     }
     if (changed) this.storage.save()

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { generateKeyPairSync, sign } from 'node:crypto'
-import { authClockSkew, authMaxLifetime, Security } from '../src/security'
+import { authClockSkew, authV1MaxLifetime, Security } from '../src/security'
 
 const { publicKey, privateKey } = generateKeyPairSync('ed25519')
 const key = publicKey.export({ format: 'der', type: 'spki' }).toString('base64')
@@ -30,7 +30,11 @@ describe('auth token expiry', () => {
     expect(() => verify(token(-3600))).toThrow('authorization expired')
   })
   test('rejects a token that expires too late', () => {
-    expect(() => verify(token(authMaxLifetime + authClockSkew + 5))).toThrow('authorization expires too late')
+    expect(() => verify(token(authV1MaxLifetime + authClockSkew + 5))).toThrow('authorization expires too late')
+  })
+  test('caps a v0 token at a v1 token\'s minute, which the Hub 1.0 app signs', () => {
+    expect(verify(token(authV1MaxLifetime + authClockSkew - 1))).toBe(key)
+    expect(() => verify(token(5 * 60))).toThrow('authorization expires too late')
   })
   test('rejects a non-decimal expiry', () => {
     const time = (Math.round(Date.now() / 1000) + 10).toString(36)
