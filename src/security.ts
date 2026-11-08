@@ -943,7 +943,8 @@ export class V1Keys {
     const id = deviceId(key)
     if (this.ids.has(id)) return
     this.ids.add(id)
-    this.storage.save()
+    // At once, not a second later: a restart in between would take v0 from the key again
+    this.storage.write().catch(error => console.error('Failed to write data/v1-keys.json:', error))
   }
 }
 

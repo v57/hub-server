@@ -54,8 +54,8 @@ describe('v0 transition', () => {
     expect(await v0Opens(app)).toBe(true)
     expect(await v1(app).sender.send('hub/info')).toMatchObject({ key: security.hubKey })
     expect(await v0Opens(app)).toBe(false)
-    // Stored, so a restart keeps it
-    await security.v1Keys.storage.write()
+    // Stored at once, so a restart right after keeps it
+    await Bun.sleep(50)
     const stored = new V1Keys()
     await stored.storage.load()
     expect(stored.has(app.key)).toBe(true)
