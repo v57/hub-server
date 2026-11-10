@@ -355,6 +355,25 @@ try {
     const outside = await rejection(ask('billing/refund'))
     assert(outside === 'permissions required|forbidden', `outside its paths → ${outside}`)
   })
+  await check('hub/grant/check counts a group\'s permissions, set as the Hub app sets them', async () => {
+    // The Hub app's Access page: a group made with `set`, a member added by bare key, permissions ticked with `set`
+    const member = newKey()
+    const group = 'Moderators'
+    const ask = (path: string) => svc.send('hub/grant/check', { path, caller: { key: member.pub } })
+    await ownerC.send('hub/group/update', { group, set: [] })
+    await ownerC.send('hub/group/update/users', { group, add: [member.pub] })
+    const before: any = await ask('e2e/moderate')
+    assert(before?.allowed === false, `before the group's permission ${JSON.stringify(before)}`)
+    await ownerC.send('hub/group/update', { group, set: ['e2e/moderate'] })
+    const after: any = await ask('e2e/moderate')
+    assert(after?.allowed === true, `after the group's permission ${JSON.stringify(after)}`)
+    const other: any = await ask('e2e/other')
+    assert(other?.allowed === false, `a path the group wasn't given ${JSON.stringify(other)}`)
+    await ownerC.send('hub/group/update/users', { group, remove: [member.pub] })
+    const left: any = await ask('e2e/moderate')
+    assert(left?.allowed === false, `after leaving the group ${JSON.stringify(left)}`)
+    await ownerC.send('hub/group/remove', group).catch(() => {})
+  })
   await check('a draining provider finishes running calls and takes no new ones', async () => {
     const provider = (key: Key, answer: (release: Promise<void>) => Promise<string>, release: Promise<void>) => {
       const channel = new Channel<any>()
