@@ -7,6 +7,7 @@ import { validateJoinAdmission } from '../src/network/crypto'
 import { NetworkAPI } from '../src/network/api'
 import type { DirectBootstrapResponse } from '../src/network/wire'
 import { Security } from '../src/security'
+import { MAX_HELD_INVITATIONS } from '../src/network/registry'
 import type { State } from '../src/hub'
 
 // Signed by hub-service-go (protocol.SignEnvelope), so this also checks that
@@ -165,6 +166,91 @@ describe('hub/net/bind join', () => {
     test('refuses a key without a device to approve', async () => {
       const api = withInviter(false)
       await expect(bind(api, state(joinerKey, 'joiner'))).rejects.toMatchObject({ code: 'forbidden' })
+    })
+  })
+
+  // Hub app H-034: a member's Add a Device asks the hub machine's agent, an owner's, to make the invitation. The agent
+  // holds it for the member, so the joiner waits for an owner all the same; the owner's own invitations don't.
+  describe('invited by the hub machine\'s agent for a member', () => {
+    const device = (approved: boolean) =>
+      ({ key: joinerKey, id: 'joiner', certificate: { deviceId: 'joiner-device' }, ...(approved ? { device: 'joiner-device' } : {}) }) as unknown as State
+    const machine = state(admission.inviterServiceKey, 'inviter-connection')
+    const week = () => new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString()
+    const bind = async (api: NetworkAPI, joiner: State) => {
+      const realNow = Date.now
+      Date.now = () => issuedAt + 1000
+      try {
+        return await api.bindAgent(request(admission), {} as never, joiner)
+      } finally {
+        Date.now = realNow
+      }
+    }
+    const held = () => {
+      const api = withInviter(true)
+      api.holdInvitation({ replayId: admission.replayId, expiresAt: week(), by: { key: 'member', device: 'member-device', name: 'iPhone' } }, machine)
+      return api
+    }
+
+    test('leaves the device pending for an owner', async () => {
+      const api = held()
+      let approved = 0
+      api.onBindApprove = () => (approved += 1)
+      await expect(bind(api, device(false))).rejects.toMatchObject({ code: 'approval_required' })
+      await expect(bind(api, state(joinerKey, 'joiner'))).rejects.toMatchObject({ code: 'forbidden' })
+      expect(approved).toBe(0)
+      expect(api.registry.heldInvitation(admission.replayId)).toEqual({ key: 'member', device: 'member-device', name: 'iPhone' })
+    })
+
+    test('tells a denied device so', async () => {
+      const api = held()
+      api.isDenied = id => id === 'joiner-device'
+      await expect(bind(api, device(false))).rejects.toMatchObject({ code: 'denied' })
+    })
+
+    test('admits the device once an owner approved it', async () => {
+      const joined = await bind(held(), device(true))
+      expect(joined.profile.device).toBe('joiner-device')
+    })
+
+    test("admits the owner's own invitation at once", async () => {
+      const api = withInviter(true)
+      let approved = 0
+      api.onBindApprove = () => (approved += 1)
+      await bind(api, device(false))
+      expect(approved).toBe(1)
+    })
+
+    test('holds only for an owner or a bound agent, and only a valid invitation', () => {
+      const api = withInviter(false)
+      const hold = (body: unknown, by: State) => {
+        try {
+          api.holdInvitation(body, by)
+          return 'ok'
+        } catch (error) {
+          return (error as { code: string }).code
+        }
+      }
+      const replayId = admission.replayId
+      expect(hold({ replayId, expiresAt: week() }, state('stranger', 'stranger'))).toBe('forbidden')
+      expect(hold({ replayId: 'short', expiresAt: week() }, machine)).toBe('invalid_request')
+      expect(hold({ replayId, expiresAt: new Date(Date.now() - 60_000).toISOString() }, machine)).toBe('invalid_request')
+      expect(hold({ replayId, expiresAt: new Date(Date.now() + 9 * 24 * 3600 * 1000).toISOString() }, machine)).toBe('invalid_request')
+      expect(hold({ replayId, expiresAt: week() }, machine)).toBe('ok')
+      expect(api.registry.heldInvitation(replayId, new Date(Date.now() + 8 * 24 * 3600 * 1000))).toBeUndefined()
+    })
+
+    test('a full list refuses the next and drops only expired ones', () => {
+      const api = withInviter(true)
+      const now = new Date()
+      for (let index = 0; index < MAX_HELD_INVITATIONS; index++) {
+        api.registry.holdInvitation(`held-${index}`, {}, new Date(now.getTime() + (index === 0 ? 60_000 : 3_600_000)), now)
+      }
+      expect(() => api.registry.holdInvitation('one-more', {}, new Date(now.getTime() + 3_600_000), now)).toThrow()
+      expect(api.registry.heldInvitation('held-0', now)).toBeDefined()
+      const later = new Date(now.getTime() + 120_000)
+      api.registry.holdInvitation('one-more', {}, new Date(later.getTime() + 3_600_000), later)
+      expect(api.registry.heldInvitation('held-0', later)).toBeUndefined()
+      expect(api.registry.heldInvitation('held-1', later)).toBeDefined()
     })
   })
 })

@@ -417,6 +417,10 @@ export type NetworkErrorCode =
   | 'share_device_mismatch'
   /** A member invited this device, and an owner hasn't approved it yet */
   | 'approval_required'
+  /** An owner denied this device (`hub/device/deny`) */
+  | 'denied'
+  /** Too many of something held at once (held invitations) */
+  | 'unavailable'
 
 export interface NetworkError extends Versioned {
   code: NetworkErrorCode

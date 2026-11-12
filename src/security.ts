@@ -113,8 +113,9 @@ const publicBuiltins = new Set([
 ])
 // `hub/net/bind` keeps the proof of its bind kind, `hub/net/node` tells agents where their node is, `hub/pair` makes
 // the holder of the pairing code an owner, `hub/grant/check` limits services to their own paths,
-// `hub/profile/update` labels the caller's own connection, `hub/device/request` answers for its own certificate
-const authBuiltins = new Set(['hub/api/services', 'hub/net/bind', 'hub/net/node', 'hub/pair', 'hub/grant/check', 'hub/profile/update', 'hub/device/request', 'hub/device/attach/ask'])
+// `hub/profile/update` labels the caller's own connection, `hub/device/request` answers for its own certificate,
+// `hub/net/invitations/hold` checks for an owner or an agent itself
+const authBuiltins = new Set(['hub/api/services', 'hub/net/bind', 'hub/net/node', 'hub/pair', 'hub/grant/check', 'hub/profile/update', 'hub/device/request', 'hub/device/attach/ask', 'hub/net/invitations/hold'])
 const reporterBuiltins = new Set(['hub/device/describe', 'hub/device/data'])
 // The attach paths check their caller themselves: an owner, or the parent on its own connection
 const grantBuiltins = new Set(['hub/devices', 'hub/devices/data', 'hub/device/attach', 'hub/device/attach/requests', 'hub/device/attach/dismiss', 'hub/device/detach'])

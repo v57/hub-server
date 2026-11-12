@@ -167,6 +167,7 @@ export class Hub {
       this.devices.devicesState.setNeedsUpdate()
     }
     networkAPI.onBindApprove = state => this.devices.approveConnection(state)
+    networkAPI.isDenied = id => !!this.devices.registry.device(id)?.denied
     networkAPI.deviceLabel = id => this.devices.registry.device(id)?.name
     networkAPI.serviceDevice = key => this.devices.registry.data.services[key]?.device
     this.devices.sharedWith = state => networkAPI.devicesSharedWith(state)

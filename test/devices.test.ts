@@ -248,6 +248,38 @@ describe('devices on the hub', () => {
     await pendingHas(id, true)
   })
 
+  // Hub app H-033: Deny forgot the request, and the device, still connected, asked again at once with a new code
+  test('a denied device stays denied until an owner takes it back', async () => {
+    const device = makeKey()
+    const id = deviceId(device.key)
+    const service = makeKey()
+    let c = client(v1(service, device))
+    const asked = await until<any>(c, 'hub/device/request', r => r.status === 'pending')
+    await owners.sender.send('hub/device/deny', { id })
+    expect(await until<any>(c, 'hub/device/request', r => r.status === 'denied')).toEqual({ id, status: 'denied' })
+    await pendingHas(id, false)
+    expect(await listed(id, d => d?.denied)).toMatchObject({ denied: true, approved: false })
+    // Asking again, also on a new connection, makes no new request
+    c.sender.stop()
+    c = client(v1(service, device))
+    expect(await until<any>(c, 'hub/device/request', r => r.status !== 'waiting')).toMatchObject({ status: 'denied' })
+    await pendingHas(id, false)
+    await expect(c.sender.send('hub/device/deny', { id })).rejects.toThrow('permissions required')
+    // Removing it lets it ask again, with a new code
+    await owners.sender.send('hub/device/remove', { id })
+    c.sender.stop()
+    c = client(v1(service, device))
+    const again = await until<any>(c, 'hub/device/request', r => r.status === 'pending')
+    expect(again.codeValue).not.toBe(asked.codeValue)
+    // Denied again, an owner can still approve it deliberately
+    await owners.sender.send('hub/device/deny', { id })
+    await until<any>(c, 'hub/device/request', r => r.status === 'denied')
+    await owners.sender.send('hub/device/approve', { id })
+    await until<any>(c, 'hub/device/request', r => r.status === 'approved')
+    expect((await listed(id, d => d?.approved)).denied).toBeUndefined()
+    await expect(owners.sender.send('hub/device/deny', { id })).rejects.toThrow('device approved')
+  })
+
   test('revoking a device closes it, revokes its keys and ignores its certificates', async () => {
     const device = makeKey()
     const id = deviceId(device.key)

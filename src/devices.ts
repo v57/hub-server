@@ -121,6 +121,8 @@ export interface StoredDevice {
   createdAt: string
   lastSeen: string
   revoked: string | null
+  /** An owner denied its request: it stays off the pending list and is told so, until an owner approves or forgets it */
+  denied?: string
   capabilities?: Record<string, unknown>
   /** The parent that signed for this device. Checked once at attach, and calls never walk it. */
   attached?: { parent: string; parentKey: string; at: number; signature: string; linked?: true }
@@ -219,7 +221,7 @@ export class DeviceRegistry {
       }
       held.add(normalizeName(name))
     }
-    const pending = entries.filter(([, device]) => !device.approved && !device.revoked)
+    const pending = entries.filter(([, device]) => !device.approved && !device.revoked && !device.denied)
     pending.sort(([, left], [, right]) => left.createdAt.localeCompare(right.createdAt))
     for (const [id] of pending.slice(0, Math.max(0, pending.length - maxPendingDevices))) {
       delete this.data.devices[id]
@@ -295,6 +297,7 @@ export class DeviceRegistry {
   private settle(id: string, device: StoredDevice) {
     if (device.approved) return
     device.approved = true
+    delete device.denied
     if (device.nameByOwner) {
       this.claim(id, device, device.name)
     } else {
@@ -324,7 +327,7 @@ export class DeviceRegistry {
   /** A device with a certificate asks to attach. Ignored once attached or turned down. */
   askAttach(id: string, parent?: string) {
     const device = this.require(id)
-    if (device.revoked || device.attached || device.attachDismissed) return
+    if (device.revoked || device.denied || device.attached || device.attachDismissed) return
     if (device.attachAsk && device.attachAsk.parent === parent) return
     device.attachAsk = { at: new Date().toISOString(), ...(parent ? { parent } : {}) }
     this.save()
@@ -339,7 +342,7 @@ export class DeviceRegistry {
   /** What's asked of the hub right now, oldest first */
   attachRequests(): AttachRequest[] {
     return Object.entries(this.data.devices)
-      .filter(([, device]) => device.attachAsk && !device.attached && !device.revoked)
+      .filter(([, device]) => device.attachAsk && !device.attached && !device.revoked && !device.denied)
       .sort(([, left], [, right]) => left.attachAsk!.at.localeCompare(right.attachAsk!.at))
       .map(([id, device]) => ({
         id,
@@ -444,6 +447,20 @@ export class DeviceRegistry {
     this.save()
     return device
   }
+  /**
+   * Turns a pending request down for good: it leaves the pending list and keeps its row, so the same device asking
+   * again is told it was denied instead of making a new request. Approving it, or removing it to let it ask again,
+   * undoes this.
+   */
+  deny(id: string) {
+    const device = this.require(id)
+    if (device.revoked) throw 'device revoked'
+    if (device.approved) throw 'device approved'
+    if (device.denied) return
+    device.denied = new Date().toISOString()
+    delete device.attachAsk
+    this.save()
+  }
   rename(id: string, name: unknown): StoredDevice {
     if (typeof name !== 'string' || !name.trim() || bytes(name.trim()) > 64) throw 'invalid name'
     const device = this.require(id)
@@ -490,7 +507,7 @@ export class DeviceRegistry {
   }
   pending(): PendingDevice[] {
     return Object.entries(this.data.devices)
-      .filter(([, device]) => !device.approved && !device.revoked)
+      .filter(([, device]) => !device.approved && !device.revoked && !device.denied)
       .map(([id, device]) => ({
         id,
         key: device.key,
@@ -509,7 +526,7 @@ export class DeviceRegistry {
   /** The ids of pending requests, oldest first */
   pendingIds(): string[] {
     return Object.entries(this.data.devices)
-      .filter(([, device]) => !device.approved && !device.revoked)
+      .filter(([, device]) => !device.approved && !device.revoked && !device.denied)
       .sort(([, left], [, right]) => left.createdAt.localeCompare(right.createdAt))
       .map(([id]) => id)
   }

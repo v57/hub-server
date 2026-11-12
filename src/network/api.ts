@@ -52,6 +52,8 @@ import { defaultHubNetNode } from './node-store'
 export const PEER_LINK_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000
 /** `share` links a member gets at most: a device has 16 links (hub-net-node's PROTOCOL.md), one of them its hub link */
 export const MAX_SHARE_LINKS = 15
+/** The longest an invitation lives (the parsers' maximum lifetime) */
+export const MAX_INVITATION_LIFETIME_MS = 8 * 24 * 60 * 60 * 1000
 
 /** `100.96.0.2` → `100.96.0.2/32`, an IPv6 address → `/128` */
 export const hostRoute = (address: string) => address.includes(':') ? `${address}/128` : `${address}/32`
@@ -95,6 +97,8 @@ export class NetworkAPI {
   private agentDevices = new Map<string, string>()
   /** Approves a pending device whose agent passed its bind proof (protocol.md section 10) */
   onBindApprove: ((state: State) => void) | undefined
+  /** Whether an owner denied the device of this id (`hub/device/deny`) */
+  isDenied: ((device: string) => boolean) | undefined
   /** The coordinator (hub-net-node) devices meet each other at */
   coordinator: () => string = () => defaultHubNetNode
   /** The port the hub listens on, which a member's `hub` link lets it open on the hub's machine */
@@ -366,16 +370,51 @@ export class NetworkAPI {
       throw networkError('forbidden', 'a valid invitation admission is required to join', false)
     }
     // Members may invite, but only an owner admits (security decisions 1.0, Hub 4): a device a member invited joins
-    // once an owner approved it, by its name and code, like any other device asking to join.
-    if (!this.isMember(state) && !this.security.isOwner({ key: inviter!.key, device: inviter!.device })) {
+    // once an owner approved it, by its name and code, like any other device asking to join. That's a member's own
+    // agent signing, or the hub machine's agent signing an invitation a member asked it for (held by its replay id).
+    if (!this.isMember(state) && (!this.security.isOwner({ key: inviter!.key, device: inviter!.device })
+      || this.registry.heldInvitation(admission?.replayId) !== undefined)) {
       if (!state.certificate?.deviceId) {
         throw networkError('forbidden', "a member's invitation admits only a device an owner approves", false)
       }
       if (!state.device) {
+        if (this.isDenied?.(state.certificate.deviceId)) throw networkError('denied', 'an owner denied this device', false)
         throw networkError('approval_required', 'an owner must approve this device before it joins', true)
       }
     }
     return this.registerAuthenticatedProfile(profile, state)
+  }
+
+  /**
+   * `hub/net/invitations/hold`: the hub machine's agent made an invitation a member asked for, so whoever joins with it
+   * waits for an owner. Owners and bound agents only; holding asks for more approval, never less.
+   */
+  holdInvitation(body: unknown, state: State): { success: true } {
+    if (!this.security.isOwner(state) && !(state.key && this.agents.getProfile(state.key))) {
+      throw networkError('forbidden', 'only an owner or a network agent holds invitations', false)
+    }
+    const request = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>
+    const replayId = request.replayId
+    if (typeof replayId !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(replayId)) {
+      throw networkError('invalid_request', 'invalid replayId', false)
+    }
+    const now = Date.now()
+    const expiresAt = typeof request.expiresAt === 'string' ? Date.parse(request.expiresAt) : NaN
+    if (!(expiresAt > now) || expiresAt - now > MAX_INVITATION_LIFETIME_MS) {
+      throw networkError('invalid_request', 'invalid expiresAt', false)
+    }
+    const by: { key?: string; device?: string; name?: string } = {}
+    const asked = (request.by && typeof request.by === 'object' ? request.by : {}) as Record<string, unknown>
+    for (const field of ['key', 'device', 'name'] as const) {
+      const value = asked[field]
+      if (typeof value === 'string' && Buffer.byteLength(value) <= 512) by[field] = value
+    }
+    try {
+      this.registry.holdInvitation(replayId, by, new Date(expiresAt), new Date(now))
+    } catch (error) {
+      throw networkError('unavailable', error instanceof Error ? error.message : String(error), true)
+    }
+    return { success: true }
   }
 
   /**

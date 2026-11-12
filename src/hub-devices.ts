@@ -31,6 +31,8 @@ export interface Device {
   parent?: string
   approved: boolean
   revoked: boolean
+  /** An owner denied its request (`hub/device/deny`) */
+  denied?: true
   online: boolean
   network?: 'online' | 'offline'
   overlay?: { address: string; authority: string }
@@ -48,7 +50,7 @@ export interface Device {
 /** `hub/device/request`: how a connection's device stands. No code before `codeValue` comes from the hub. */
 export interface DeviceRequest {
   id: string
-  status: 'waiting' | 'pending' | 'approved'
+  status: 'waiting' | 'pending' | 'approved' | 'denied'
   name?: string
   codeValue?: string
   /** The parent that signed for it, once attached */
@@ -205,6 +207,8 @@ export class HubDevices {
       if (!this.registry.device(id)) return { id, status: 'waiting' }
       return this.request(state)
     }
+    // A denied device hears so, with no code to compare
+    if (device.denied) return { id, status: 'denied' }
     return {
       id,
       status: device.approved ? 'approved' : 'pending',
@@ -329,6 +333,12 @@ export class HubDevices {
     for (const connection of this.connectionsOf(id)) this.placeOnDevice(connection.state)
     this.linksChanged()
     return this.describe(id)!
+  }
+
+  /** Denies a pending request. Its connections stay, as plain keys that hear "denied", so it doesn't come back as a new one. */
+  deny(id: string) {
+    this.registry.deny(id)
+    this.gate.forget(request => request.deviceId === id)
   }
 
   rename(id: string, name: unknown): Device {
@@ -476,6 +486,7 @@ export class HubDevices {
       parent: device.parent,
       approved: device.approved,
       revoked: !!device.revoked,
+      ...(device.denied ? { denied: true as const } : {}),
       online: attached.length > 0 || id === this.selfId,
       ...(network ? { network } : {}),
       ...(overlay ? { overlay } : {}),
@@ -590,6 +601,7 @@ export class HubDevices {
       })
       .stream('hub/devices/pending', () => this.pendingState.makeIterator())
       .post('hub/device/approve', ({ body }) => this.approve(body?.id))
+      .post('hub/device/deny', ({ body }) => this.deny(body?.id))
       .post('hub/device/rename', ({ body }) => this.rename(body?.id, body?.name))
       .post('hub/device/remove', ({ body }) => this.remove(body?.id))
       .post('hub/device/revoke', ({ body }) => this.revoke(body?.id, body?.keepServices))

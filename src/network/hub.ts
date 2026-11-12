@@ -57,6 +57,7 @@ export const networkProtectedApi = {
   'network/gateway/grant': 'Hub Network: Use Gateway',
   'network/gateway/revocations': 'Hub Network: Use Gateway',
   'network/gateway/diagnostics': 'Hub Network: View Status',
+  'hub/net/invitations/hold': 'Hub Network: Hold Invitations',
 } as const
 
 /**
@@ -143,6 +144,7 @@ export function registerNetworkAPIs(
       return { success: true, status }
     })
   }
+  channel.post('hub/net/invitations/hold', ({ body, state }) => networkAPI.holdInvitation(body, state))
   // Connection grant issuance
   channel.post('network/connection/grant', async ({ body, state }) => {
     const grant = await networkAPI.issueConnectionGrant(

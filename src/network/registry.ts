@@ -138,6 +138,32 @@ export class NetworkRegistry {
     this.storage.save()
   }
 
+  /**
+   * Holds whoever joins with the invitation of `replayId` for an owner, until it expires. A full list refuses the next
+   * one rather than dropping one, which would let its joiner in without an owner.
+   */
+  holdInvitation(replayId: string, by: HeldInvitation['by'], expiresAt: Date, now = new Date()): void {
+    if (this.storage.corrupt) throw new Error('network registry is corrupt')
+    const kept: Record<string, HeldInvitation> = {}
+    for (const [id, hold] of Object.entries(this.data.heldInvitations)) {
+      if (Date.parse(hold.expiresAt) > now.getTime()) kept[id] = hold
+    }
+    if (Object.keys(kept).length >= MAX_HELD_INVITATIONS && !kept[replayId]) {
+      this.data.heldInvitations = kept
+      throw new Error('too many held invitations')
+    }
+    kept[replayId] = { by, expiresAt: expiresAt.toISOString() }
+    this.data.heldInvitations = kept
+    this.storage.save()
+  }
+
+  /** Who asked for the invitation of `replayId`, while it's held */
+  heldInvitation(replayId: unknown, now = new Date()): HeldInvitation['by'] | undefined {
+    if (typeof replayId !== 'string' || !Object.hasOwn(this.data.heldInvitations, replayId)) return
+    const hold = this.data.heldInvitations[replayId]!
+    return Date.parse(hold.expiresAt) > now.getTime() ? hold.by : undefined
+  }
+
   /** A removed device that enrolled again is no longer refused as a peer */
   clearRevokedDevice(device: string): boolean {
     const count = this.data.revokedDevices.length
@@ -729,6 +755,7 @@ function defaultRegistryData(): RegistryData {
     members: {},
     released: [],
     revokedDevices: [],
+    heldInvitations: {},
   }
 }
 
@@ -743,6 +770,7 @@ function migrateRegistryData(data: Partial<RegistryData> | undefined): RegistryD
     members: data?.members ?? {},
     released: data?.released ?? [],
     revokedDevices: data?.revokedDevices ?? [],
+    heldInvitations: data?.heldInvitations ?? {},
   }
 }
 
@@ -779,6 +807,20 @@ export interface RegistryData {
   released: { addresses: string[]; at: string }[]
   /** WireGuard keys of removed and revoked devices, for `network/devices/revoked` */
   revokedDevices: RevokedDevice[]
+  /**
+   * Invitations a member asked the hub's machine to make (`hub/net/invitations/hold`), by replay id: whoever joins with
+   * one waits for an owner, though the hub's own agent signed it
+   */
+  heldInvitations: Record<string, HeldInvitation>
+}
+
+/** Most held invitations at once */
+export const MAX_HELD_INVITATIONS = 1024
+
+export interface HeldInvitation {
+  /** Who asked for it, as the agent that made it says */
+  by: { key?: string; device?: string; name?: string }
+  expiresAt: string
 }
 
 /** Stored by member key: `device:<id>` for device-attached agents, else the agent's service key */
